@@ -1,0 +1,22 @@
+{
+  "name": "notification-platform",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w @notification/service",
+    "db:generate": "npm run generate -w @notification/database",
+    "db:migrate": "npm run migrate -w @notification/database",
+    "db:studio": "npm run studio -w @notification/database",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "tsx": "^4.19.1",
+    "@types/node": "^22.7.5"
+  }
+}

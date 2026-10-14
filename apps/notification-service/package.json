@@ -1,0 +1,23 @@
+{
+  "name": "@notification/service",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@notification/database": "*",
+    "@notification/shared-types": "*",
+    "@notification/shared-utils": "*",
+    "express": "^4.21.0",
+    "pino": "^9.4.0",
+    "pino-http": "^10.3.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "tsx": "^4.19.1"
+  }
+}
