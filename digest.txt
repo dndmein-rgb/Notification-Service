@@ -1,0 +1,1306 @@
+Directory structure:
+└── notification-platform/
+    ├── docker-compose.yml
+    ├── package.json
+    ├── tsconfig.base.json
+    ├── .env.example
+    ├── apps/
+    │   └── notification-service/
+    │       ├── package.json
+    │       ├── tsconfig.json
+    │       ├── .env.example
+    │       └── src/
+    │           ├── app.ts
+    │           ├── server.ts
+    │           ├── config/
+    │           │   ├── index.ts
+    │           │   └── logger.ts
+    │           ├── infrastructure/
+    │           │   └── prisma.ts
+    │           ├── middlewares/
+    │           │   ├── cors.middleware.ts
+    │           │   ├── error.middleware.ts
+    │           │   ├── req.middleware.ts
+    │           │   └── validate.middleware.ts
+    │           └── modules/
+    │               └── notification/
+    │                   ├── notification.container.ts
+    │                   ├── notification.controller.ts
+    │                   ├── notification.interface.ts
+    │                   ├── notification.repository.ts
+    │                   ├── notification.route.ts
+    │                   ├── notification.schema.ts
+    │                   ├── notification.service.ts
+    │                   └── notification.types.ts
+    └── packages/
+        ├── database/
+        │   ├── package.json
+        │   ├── prisma.config.ts
+        │   ├── tsconfig.json
+        │   ├── .env.example
+        │   ├── prisma/
+        │   │   └── schema.prisma
+        │   └── src/
+        │       ├── client.ts
+        │       └── index.ts
+        ├── shared-types/
+        │   ├── package.json
+        │   ├── tsconfig.json
+        │   └── src/
+        │       └── index.ts
+        └── shared-utils/
+            ├── package.json
+            ├── tsconfig.json
+            └── src/
+                ├── asyncHandler.ts
+                ├── errors.ts
+                └── index.ts
+
+================================================
+FILE: docker-compose.yml
+================================================
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notification
+      POSTGRES_PASSWORD: notification
+      POSTGRES_DB: notification
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notification"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # Web UI
+
+volumes:
+  postgres_data:
+
+
+================================================
+FILE: package.json
+================================================
+{
+  "name": "notification-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production-style multi-channel Notification Platform (Postgres source of truth + BullMQ + Kafka + Outbox)",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:packages": "npm run build -w @notification/shared-types && npm run build -w @notification/shared-utils && npm run build -w @notification/database",
+    "dev:api": "npm run dev -w @notification/service",
+    "dev:worker": "npm run dev -w @notification/worker",
+    "db:generate": "npm run generate -w @notification/database",
+    "db:migrate": "npm run migrate -w @notification/database",
+    "db:studio": "npm run studio -w @notification/database",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f",
+    "lint": "npm run lint --workspaces --if-present",
+    "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules apps/*/dist packages/*/dist"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "tsx": "^4.19.1",
+    "@types/node": "^22.7.5",
+    "prisma": "^7.10.0"
+  }
+}
+
+
+================================================
+FILE: tsconfig.base.json
+================================================
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  }
+}
+
+
+================================================
+FILE: .env.example
+================================================
+# Server
+NODE_ENV=development
+PORT=3000
+LOG_LEVEL=info
+
+# Database
+DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
+
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# Kafka
+KAFKA_BROKERS=localhost:9092
+
+# Admin
+ADMIN_API_KEY=dev-admin-key-change-me
+
+# Mailhog (later)
+SMTP_HOST=localhost
+SMTP_PORT=1025
+
+
+================================================
+FILE: apps/notification-service/package.json
+================================================
+{
+  "name": "@notification/service",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@notification/database": "*",
+    "@notification/shared-types": "*",
+    "@notification/shared-utils": "*",
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "cors": "^2.8.6",
+    "express": "^4.21.0",
+    "pg": "^8.23.0",
+    "pino": "^9.4.0",
+    "pino-http": "^10.3.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "pino-pretty": "^11.3.0",
+    "prisma": "^7.10.0",
+    "tsx": "^4.19.1",
+    "@types/cors": "^2.8.17",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}
+
+
+
+================================================
+FILE: apps/notification-service/tsconfig.json
+================================================
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "types":["node"]
+  },
+  "include": ["src"]
+}
+
+
+================================================
+FILE: apps/notification-service/.env.example
+================================================
+# Server
+NODE_ENV=development
+PORT=3000
+LOG_LEVEL=info
+
+# Database
+DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
+
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# Kafka
+KAFKA_BROKERS=localhost:9092
+
+# Admin
+ADMIN_API_KEY=dev-admin-key-change-me
+
+# Mailhog (later)
+SMTP_HOST=localhost
+SMTP_PORT=1025
+
+CLIENT_ORIGINS=http://localhost:5173
+
+
+================================================
+FILE: apps/notification-service/src/app.ts
+================================================
+import express from "express";
+import { requestLogger } from "./middlewares/req.middleware.js";
+import { corsMiddleware } from "./middlewares/cors.middleware.js";
+
+import notificationRoutes from "./modules/notification/notification.route.js"
+import { errorMiddleware } from "./middlewares/error.middleware.js";
+
+export function createApp() {
+  const app = express();
+
+  app.use(corsMiddleware)
+  app.use(express.json());
+  app.use(requestLogger)
+
+  
+  app.use("/notifications",notificationRoutes)
+
+  app.get("/health", (_req, res) => {
+    res.status(200).json({
+      status: "ok",
+      service: "notification-service",
+      timestamp: new Date().toISOString(),
+    });
+  });
+  app.use(errorMiddleware)
+  return app;
+}
+
+
+================================================
+FILE: apps/notification-service/src/server.ts
+================================================
+import { createApp } from "./app.js";
+import { config } from "./config/index.js";
+import { logger } from "./config/logger.js";
+
+async function main() {
+  const app = createApp();
+
+  app.listen(config.PORT, () => {
+    logger.info(`ðŸš€ notification-service listening on port ${config.PORT}`);
+  });
+}
+
+main().catch((err) => {
+  logger.error(err, "Failed to start server");
+  process.exit(1);
+});
+
+
+================================================
+FILE: apps/notification-service/src/config/index.ts
+================================================
+import "dotenv/config"
+import { z } from "zod";
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
+  PORT: z.coerce.number().default(3000),
+  LOG_LEVEL: z.string().default("info"),
+  DATABASE_URL: z.string(),
+  REDIS_URL: z.string(),
+  KAFKA_BROKERS: z.string(),
+  ADMIN_API_KEY: z.string().min(8),
+  CLIENT_ORIGINS: z
+          .string()
+          .min(1)
+          .transform((value) => value.split(",").map((origin) => origin.trim())),
+});
+
+const parsed = envSchema.safeParse(process.env);
+
+if (!parsed.success) {
+  console.error("Invalid environment variables:", parsed.error.flatten().fieldErrors);
+  process.exit(1);
+}
+
+export const config = {
+  ...parsed.data,
+  SERVICE_NAME: "notification-service",
+} as const;
+
+
+================================================
+FILE: apps/notification-service/src/config/logger.ts
+================================================
+import pino from "pino";
+import { config } from "./index.js";
+
+const baseLogger = pino({
+  level: config.NODE_ENV === "development" ? "debug" : "info",
+  ...(config.NODE_ENV === "development" && {
+    transport: {
+      target: "pino-pretty",
+      options: {
+        colorize: true,
+        translateTime: "SYS:standard",
+        ignore: "pid,hostname",
+      },
+    },
+  }),
+  base: {
+    service: config.SERVICE_NAME,
+  },
+});
+
+type LogMeta = Record<string, unknown> | Error | unknown;
+
+type LogFn = {
+  (msg: string, meta?: LogMeta): void;
+  (meta: LogMeta, msg?: string): void;
+};
+
+const toMergingObject = (meta?: LogMeta): Record<string, unknown> => {
+  if (meta === undefined || meta === null) {
+    return {};
+  }
+
+  if (meta instanceof Error) {
+    return {
+      err: {
+        message: meta.message,
+        name: meta.name,
+        stack: meta.stack,
+      },
+    };
+  }
+
+  if (typeof meta === "object") {
+    return meta as Record<string, unknown>;
+  }
+
+  // primitive (string/number/boolean) â€“ wrap it
+  return { value: meta };
+};
+
+const createLogFn = (level: "info" | "error" | "warn" | "debug"): LogFn => {
+  return (msgOrMeta: string | LogMeta, maybeMetaOrMsg?: string | LogMeta) => {
+    // Preferred: message first
+    // logger.error("Error during graceful shutdown", error)
+    // logger.info("Member added", { roomId })
+    if (typeof msgOrMeta === "string") {
+      const msg = msgOrMeta;
+      const obj = toMergingObject(maybeMetaOrMsg);
+      baseLogger[level](obj, msg);
+      return;
+    }
+
+    // Also support: object/error first
+    // logger.error(error, "Error during graceful shutdown")
+    // logger.info({ roomId }, "Member added")
+    const obj = toMergingObject(msgOrMeta);
+    const msg = typeof maybeMetaOrMsg === "string" ? maybeMetaOrMsg : undefined;
+
+    if (msg) {
+      baseLogger[level](obj, msg);
+    } else {
+      baseLogger[level](obj);
+    }
+  };
+};
+
+export const logger = {
+  info: createLogFn("info"),
+  error: createLogFn("error"),
+  warn: createLogFn("warn"),
+  debug: createLogFn("debug"),
+  child: baseLogger.child.bind(baseLogger),
+};
+
+
+================================================
+FILE: apps/notification-service/src/infrastructure/prisma.ts
+================================================
+import pg from "pg"
+import { config } from "../config";
+import { PrismaPg } from "@prisma/adapter-pg";
+import {PrismaClient} from "@notification/database"
+import { logger } from "../config/logger";
+
+const pool = new pg.Pool({ connectionString: config.DATABASE_URL })
+const adapter = new PrismaPg(pool)
+
+
+const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    adapter,
+    log: config.NODE_ENV === "development" ? ["error", "warn"] : ["error"],
+  });
+
+if (config.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+
+prisma.$on("query" as never, (e: { query: string; duration: number }) => {
+  if (config.LOG_LEVEL === "debug") {
+    logger.debug("prisma query", { query: e.query, durationMs: e.duration });
+  }
+})
+
+
+================================================
+FILE: apps/notification-service/src/middlewares/cors.middleware.ts
+================================================
+import cors from "cors";
+import { config } from "../config/index.js";
+
+const allowedOrigins = config.CLIENT_ORIGINS;
+
+export const corsMiddleware = cors({
+  origin: (origin, callback) => {
+    // no Origin = curl / server-to-server
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error(`Origin not allowed by CORS: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-API-Key",
+    "X-Requested-With",
+  ],
+  exposedHeaders: ["Retry-After", "RateLimit-Limit", "RateLimit-Remaining"],
+  optionsSuccessStatus: 204,
+});
+
+
+================================================
+FILE: apps/notification-service/src/middlewares/error.middleware.ts
+================================================
+import type { Request, Response, NextFunction } from "express";
+import { AppError } from "@notification/shared-utils";
+import { logger } from "../config/logger.js";
+
+export function errorMiddleware(
+  err: Error,
+  _req: Request,
+  res: Response,
+  _next: NextFunction,
+): void {
+
+  if (err instanceof AppError) {
+    logger.warn({ err, code: err.code }, err.message);
+    res.status(err.statusCode).json({
+      success: false,
+      error: {
+        code: err.code,
+        message: err.message,
+        details: err.details,
+      },
+    });
+    return;
+  }
+
+  logger.error({ err }, "Unhandled error");
+  res.status(500).json({
+    success: false,
+    error: {
+      code: "INTERNAL_ERROR",
+      message:
+        process.env.NODE_ENV === "production"
+          ? "An unexpected error occurred"
+          : err.message,
+    },
+  });
+}
+
+
+================================================
+FILE: apps/notification-service/src/middlewares/req.middleware.ts
+================================================
+import { RequestHandler } from "express";
+import { logger } from "../config/logger.js";
+
+export const requestLogger: RequestHandler=(req,res,next)=> {
+  const start = process.hrtime.bigint();
+  
+    res.on("finish", () => {
+      const durationMs =
+        Number(process.hrtime.bigint() - start) / 1_000_000;
+  
+      logger.info(
+        `${req.method} ${req.originalUrl} ${res.statusCode} - ${durationMs.toFixed(2)} ms`,
+      );
+    });
+  
+    next();
+}
+
+
+================================================
+FILE: apps/notification-service/src/middlewares/validate.middleware.ts
+================================================
+
+import type { NextFunction, Request, Response } from "express";
+import { ZodType } from "zod";
+import type { ParamsDictionary } from "express-serve-static-core";
+import { BadRequestError } from "@notification/shared-utils";
+
+type ValidationTarget = "body" | "params" | "query";
+
+export const validate =
+  <T>(schema: ZodType<T>, target: ValidationTarget = "body") =>
+  (req: Request, res: Response, next: NextFunction): void => {
+    const result = schema.safeParse(req[target]);
+    if (!result.success) {
+          const message = result.error.issues
+                    .map(({ path, message }) => `${path.join(".")}:${message}`)
+                    .join(",")
+          return next(new BadRequestError(message));
+    }
+    switch (target) {
+      case "body":
+        req.body = result.data;
+        break;
+
+      case "params":
+        req.params = result.data as ParamsDictionary;
+        break;
+
+        case "query":
+                res.locals.validatedQuery = result.data;
+                break;
+    }
+
+    next();
+  };
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/notification.container.ts
+================================================
+import { NotificationRepository } from "./notification.repository";
+import { NotificationService } from "./notification.service";
+
+const notificationRepository=new NotificationRepository();
+export const notificationService=new NotificationService(notificationRepository)
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/notification.controller.ts
+================================================
+import { asyncHandler } from "@notification/shared-utils";
+import type{Request,Response} from 'express'
+import { CreateNotificationInput, GetUserNotificationsQuery } from "./notification.schema";
+import { notificationService } from "./notification.container";
+
+export const createNotification=asyncHandler(async(req:Request,res:Response)=>{
+  const body=req.body as CreateNotificationInput;
+  const result=await notificationService.create(body)
+  res.status(201).json({
+    success:true,
+    message:"Notification created successfully",
+    data:result
+  })
+})
+
+export const userNotifications=asyncHandler(async(req:Request,res:Response)=>{
+  const {limit,page,userId,unreadOnly,tenantId}=res.locals.validatedQuery as  GetUserNotificationsQuery
+  const result=await notificationService.getUserNotifications({limit,page,userId,tenantId,unreadOnly})
+  
+  res.status(200).json({
+      success: true,
+      data: result.data,
+      meta: result.meta,
+    });
+  });
+
+export const findById=asyncHandler(async(req:Request,res:Response)=>{
+  const id=req.params.id 
+  const result=await notificationService.findNotificationById(id)
+  res.status(200).json({
+    success:true,
+    message:"Notification fetched successfully",
+    data:result
+  })
+})
+
+export const markAsRead = asyncHandler(async (req: Request, res: Response) => {
+  const id = req.params.id;
+  const result = await notificationService.markAsRead(id);
+  res.status(200).json({
+    success: true,
+    message: "Notification read succesfully",
+    data:result
+  })
+})
+
+
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/notification.interface.ts
+================================================
+import { Notification } from "@notification/database";
+import { CreateNotificationWriteData } from "./notification.types";
+
+export interface NotificationInterface{
+  create(data: CreateNotificationWriteData): Promise<Notification>
+   findByUserId(params: {
+    userId: string;
+    tenantId?: string;
+    page: number;
+    limit: number;
+    unreadOnly?: boolean;
+  }): Promise<{ data: Notification[]; total: number }>
+  findById(id: string): Promise<Notification | null>
+  markAsRead(id:string):Promise<Notification|null>
+}
+
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/notification.repository.ts
+================================================
+import { Notification } from "@notification/database";
+import { NotificationInterface } from "./notification.interface.js";
+import { CreateNotificationWriteData } from "./notification.types.js";
+import { prisma } from "../../infrastructure/prisma.js";
+
+export class NotificationRepository implements NotificationInterface {
+  async create(data: CreateNotificationWriteData): Promise<Notification> {
+    return prisma.notification.create({
+      data
+    });
+  }
+
+  async findByUserId(params: {
+    userId: string;
+    tenantId?: string;
+    page: number;
+    limit: number;
+    unreadOnly?: boolean;
+  }): Promise<{ data: Notification[]; total: number }> {
+    const { userId, tenantId, page, limit, unreadOnly } = params;
+
+    const where: any = {
+      userId,
+    };
+
+    if (tenantId) {
+      where.tenantId = tenantId;
+    }
+
+    if (unreadOnly) {
+      where.readAt = null;
+    }
+
+    const [data, total] = await Promise.all([
+      prisma.notification.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      prisma.notification.count({ where }),
+    ]);
+
+    return { data, total };
+  }
+
+
+
+    async findById(id:string):Promise<Notification|null>{
+    return prisma.notification.findUnique({
+      where:{id}
+    })
+    }
+  async markAsRead(id: string): Promise<Notification | null> {
+    return prisma.notification.update({
+      where: { id },
+      data:{readAt:new Date()}
+    })
+  }
+}
+  
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/notification.route.ts
+================================================
+import express from "express";
+import { validate } from "../../middlewares/validate.middleware";
+import {
+  CreateNotificationBodySchema,
+  GetUserNotificationsQuerySchema,
+} from "./notification.schema";
+import {
+  createNotification,
+  userNotifications,
+  findById,
+  markAsRead,
+} from "./notification.controller";
+
+const router = express.Router();
+
+router
+  .route("/create")
+  .post(validate(CreateNotificationBodySchema), createNotification);
+router
+  .route("/")
+  .get(validate(GetUserNotificationsQuerySchema, "query"), userNotifications);
+router.route("/:id").get(findById);
+router.route("/:id/mark").patch(markAsRead);
+
+export default router;
+
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/notification.schema.ts
+================================================
+import { NotificationStatus } from "@notification/shared-types";
+import { z } from "zod"
+
+export const CreateNotificationBodySchema = z.object({
+  userId: z.string().min(1,"UserId is required"),
+  tenantId: z.string().optional(),
+  type: z.string().min(1).max(200),
+  title: z.string().min(1).max(100),
+  body: z.string().min(1),
+  data: z.record(z.string(), z.json()).optional(),
+})
+
+export type CreateNotificationInput=z.infer<typeof CreateNotificationBodySchema>
+
+export const GetUserNotificationsQuerySchema = z.object({
+  userId: z.string().min(1, "userId is required"),
+  tenantId: z.string().min(1).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  unreadOnly: z
+    .enum(["true", "false"])
+    .optional()
+    .transform((v) => v === "true"),
+});
+
+export type GetUserNotificationsQuery = z.infer<typeof GetUserNotificationsQuerySchema>;
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/notification.service.ts
+================================================
+import { NotFoundError, ValidationError } from "@notification/shared-utils";
+import { NotificationInterface } from "./notification.interface.js";
+import { CreateNotificationInput } from "./notification.schema";
+
+export class NotificationService {
+  constructor(private readonly repo: NotificationInterface) {}
+
+  async create(input: CreateNotificationInput) {
+    return this.repo.create({
+      userId: input.userId,
+      tenantId: input.tenantId ?? null,
+      type: input.type,
+      title: input.title,
+      body: input.body,
+      data: input.data ?? undefined,
+      status: "DELIVERED",
+    });
+  }
+
+  async getUserNotifications(params: {
+    userId: string;
+    tenantId?: string;
+    page: number;
+    limit: number;
+    unreadOnly?: boolean;
+  }) {
+    const { userId, tenantId, page, limit, unreadOnly } = params;
+
+    if (!userId) {
+      throw new ValidationError("userId is required");
+    }
+
+    const { data, total } = await this.repo.findByUserId({
+      userId,
+      tenantId,
+      page,
+      limit,
+      unreadOnly,
+    });
+
+    return {
+      data,
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+  async findNotificationById(id: string) {
+    if (!id) {
+      throw new NotFoundError("NotificationId not found");
+    }
+    const notification = await this.repo.findById(id);
+    if (!notification) {
+      throw new NotFoundError("Notification", id);
+    }
+    return notification;
+  }
+  async markAsRead(id: string) {
+    if (!id) {
+      throw new ValidationError("Notification id is required");
+    }
+    const notification = await this.repo.findById(id);
+    if (!notification) {
+      throw new NotFoundError("Notification", id);
+    }
+    // Idempotent: already read â†’ just return it
+    if (notification.readAt) {
+      return notification;
+    }
+    return notification;
+  }
+}
+
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/notification.types.ts
+================================================
+import type { NotificationStatus, Prisma } from "@notification/database";
+
+export type CreateNotificationWriteData = {
+  userId: string;
+  tenantId?: string | null;
+  title: string;
+  type: string;
+  body: string;
+  data?: Prisma.InputJsonValue;
+  status:NotificationStatus
+}
+
+
+================================================
+FILE: packages/database/package.json
+================================================
+{
+  "name": "@notification/database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js",
+      "default": "./dist/client.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "generate": "prisma generate",
+    "migrate": "prisma migrate dev --name init",
+    "studio": "prisma studio"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "prisma": "^7.10.0",
+    "typescript": "^5.6.3"
+  }
+}
+
+
+================================================
+FILE: packages/database/prisma.config.ts
+================================================
+import "dotenv/config";
+import { defineConfig } from "prisma/config";
+
+export default defineConfig({
+  schema: "prisma/schema.prisma",
+  migrations: {
+    path: "prisma/migrations",
+  },
+  datasource: {
+    url: process.env["DATABASE_URL"],
+  },
+});
+
+
+================================================
+FILE: packages/database/tsconfig.json
+================================================
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": ["src"]
+}
+
+
+================================================
+FILE: packages/database/.env.example
+================================================
+DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
+
+
+
+================================================
+FILE: packages/database/prisma/schema.prisma
+================================================
+generator client {
+  provider = "prisma-client"
+   output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum NotificationStatus{
+PENDING
+DELIVERED
+FAILED
+}
+
+model Notification{
+id                   String          @id @default(uuid())
+status                NotificationStatus    @default(DELIVERED)
+userId                 String
+body                String
+createdAt               DateTime          @default(now())
+readAt                  DateTime?
+tenantId                 String?
+type                      String
+title                      String
+data                        Json?
+updatedAt DateTime           @updatedAt
+
+@@index([userId,createdAt])
+@@index([tenantId,userId])
+
+}
+
+
+================================================
+FILE: packages/database/src/client.ts
+================================================
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "./generated/prisma/client.js";
+import pg from "pg";
+
+export type CreatePrismaOptions = {
+  connectionString: string;
+  log?: Array<"error" | "warn" | "info" | "query">;
+};
+
+/**
+ * Factory so each app gets its own pool but the same generated client types.
+ */
+export function createPrismaClient(options: CreatePrismaOptions): PrismaClient {
+  const pool = new pg.Pool({ connectionString: options.connectionString });
+  const adapter = new PrismaPg(pool);
+
+  return new PrismaClient({
+    adapter,
+    log: options.log ?? ["error"],
+  });
+}
+
+export { PrismaClient };
+export type {
+  NotificationStatus,
+  Prisma,
+  Notification,
+} from "./generated/prisma/client.js";
+
+
+
+================================================
+FILE: packages/database/src/index.ts
+================================================
+export { PrismaClient, createPrismaClient } from "./client.js"
+
+export type{Prisma,Notification,NotificationStatus} from "./client.js"
+
+
+================================================
+FILE: packages/shared-types/package.json
+================================================
+{
+  "name": "@notification/shared-types",
+  "version": "0.0.1",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc"
+  }
+}
+
+
+================================================
+FILE: packages/shared-types/tsconfig.json
+================================================
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"]
+}
+
+
+================================================
+FILE: packages/shared-types/src/index.ts
+================================================
+export enum NotificationStatus {
+  
+  PENDING = "PENDING",
+  DELIVERED = "DELIVERED",
+  FAILED="FAILED"
+}
+
+
+
+================================================
+FILE: packages/shared-utils/package.json
+================================================
+{
+  "name": "@notification/shared-utils",
+  "version": "0.0.1",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc"
+  }
+} 
+
+
+================================================
+FILE: packages/shared-utils/tsconfig.json
+================================================
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "types":["node"]
+  },
+  "include": ["src"]
+}
+
+
+================================================
+FILE: packages/shared-utils/src/asyncHandler.ts
+================================================
+import type { Request, Response, NextFunction, RequestHandler } from "express";
+
+export function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>,
+): RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+
+================================================
+FILE: packages/shared-utils/src/errors.ts
+================================================
+export class AppError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly statusCode: number = 500,
+    public readonly details?: unknown,
+  ) {
+    super(message);
+    this.name = "AppError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(resource: string, id?: string) {
+    super(
+      "NOT_FOUND",
+      id ? `${resource} with id ${id} not found` : `${resource} not found`,
+      404,
+    );
+    this.name = "NotFoundError";
+  }
+}
+export class BadRequestError extends AppError {
+  constructor(message = "Bad Request", code = "BAD_REQUEST") {
+    super("BAD_REQUEST_ERROR",message, 400, code);
+  }
+}
+
+export class UnauthorizedError extends AppError {
+  constructor(message = "Unauthorized", code = "UNAUTHORIZED") {
+    super("UNAUTHORIZED_ERROR",message, 401, code);
+  }
+}
+
+export class ForbiddenError extends AppError {
+  constructor(message = "Forbidden", code = "FORBIDDEN") {
+    super("FORBIDDEN_ERROR",message, 403, code);
+  }
+}
+
+
+
+export class InternalServerError extends AppError {
+  constructor(message = "Internal Server Error", code = "INTERNAL_SERVER_ERROR") {
+    super("INTERNAL_SERVICE_ERROR",message, 500, code);
+  }
+}
+export class ValidationError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super("VALIDATION_ERROR", message, 400, details);
+    this.name = "ValidationError";
+  }
+}
+
+export class ConflictError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super("CONFLICT", message, 409, details);
+    this.name = "ConflictError";
+  }
+}
+
+export class InvalidStateTransitionError extends AppError {
+  constructor(from: string, to: string) {
+    super(
+      "INVALID_STATE_TRANSITION",
+      `Cannot transition job from ${from} to ${to}`,
+      409,
+    );
+    this.name = "InvalidStateTransitionError";
+  }
+}
+
+export class RetryableError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super("RETRYABLE", message, 503, details);
+    this.name = "RetryableError";
+  }
+}
+
+export class PermanentError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super("PERMANENT", message, 422, details);
+    this.name = "PermanentError";
+  }
+}
+
+/** HTTP 429 â€“ too many requests in the current window */
+export class RateLimitError extends AppError {
+  constructor(
+    message = "Rate limit exceeded",
+    public readonly retryAfterSec: number = 60,
+    details?: unknown,
+  ) {
+    super("RATE_LIMITED", message, 429, details);
+    this.name = "RateLimitError";
+  }
+}
+
+
+================================================
+FILE: packages/shared-utils/src/index.ts
+================================================
+export * from "./errors.js"
+export { asyncHandler } from "./asyncHandler.js";
+
+
+export function generateId(prefix = ""): string {
+  const id = crypto.randomUUID().replace(/-/g, "");
+  return prefix ? `${prefix}_${id}` : id;
+}
+
+export function calculateBackoffMs(attempt: number, baseMs = 1000, maxMs = 60_000): number {
+  const exp = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
+  // full jitter
+  return Math.floor(Math.random() * exp);
+}
+
