@@ -25,4 +25,7 @@ export type {
   NotificationStatus,
   Prisma,
   Notification,
+  Delivery,
+  DeliveryStatus,
+  DeliveryChannel
 } from "./generated/prisma/client.js";

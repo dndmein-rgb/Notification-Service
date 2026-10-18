@@ -10,12 +10,27 @@ datasource db {
 enum NotificationStatus{
 PENDING
 DELIVERED
+PARTIAL
 FAILED
+}
+
+enum DeliveryChannel{
+IN_APP
+EMAIL
+SMS
+PUSH
+}
+enum DeliveryStatus{
+QUEUED
+SENDING
+SENT
+FAILED
+DEAD
 }
 
 model Notification{
 id                   String          @id @default(uuid())
-status                NotificationStatus    @default(DELIVERED)
+status                NotificationStatus    @default(PENDING)
 userId                 String
 body                String
 createdAt               DateTime          @default(now())
@@ -24,9 +39,29 @@ tenantId                 String?
 type                      String
 title                      String
 data                        Json?
-updatedAt DateTime           @updatedAt
-
+updatedAt                   DateTime           @updatedAt
+  
 @@index([userId,createdAt])
 @@index([tenantId,userId])
+deliveries      Delivery[]
+}
 
+model Delivery{
+id                          String     @id @default(uuid())
+notificationId               String
+channel                       DeliveryChannel
+status                         DeliveryStatus   @default(QUEUED)
+attempts                        Int              @default(0)
+maxAttempts                      Int              @default(3)
+lastError                         String?
+providerMessageId                  String?
+sentAt                              DateTime?
+createdAt                          DateTime  @default(now())
+updatedAt                           DateTime  @updatedAt
+
+notification           Notification @relation(fields:[notificationId],references:[id],onDelete:Cascade)
+
+@@unique([notificationId,channel])
+@@index([status, createdAt])
+@@index([notificationId])
 }

@@ -13,7 +13,15 @@ const envSchema = z.object({
           .string()
           .min(1)
           .transform((value) => value.split(",").map((origin) => origin.trim())),
+  EMAIL_ENABLED: z
+      .enum(["true", "false"])
+      .default("true")
+      .transform((v) => v === "true"),
+    SMTP_HOST: z.string().default("localhost"),
+    SMTP_PORT: z.coerce.number().default(1025),
+    SMTP_FROM: z.string().default("noreply@notification.local"),
 });
+
 
 const parsed = envSchema.safeParse(process.env);
 

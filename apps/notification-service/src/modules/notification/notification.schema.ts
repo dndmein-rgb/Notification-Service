@@ -1,4 +1,3 @@
-import { NotificationStatus } from "@notification/shared-types";
 import { z } from "zod"
 
 export const CreateNotificationBodySchema = z.object({

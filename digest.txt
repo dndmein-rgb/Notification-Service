@@ -31,7 +31,11 @@ Directory structure:
     │                   ├── notification.route.ts
     │                   ├── notification.schema.ts
     │                   ├── notification.service.ts
-    │                   └── notification.types.ts
+    │                   ├── notification.types.ts
+    │                   └── adapters/
+    │                       ├── channel-adapter.interface.ts
+    │                       ├── email.adapter.ts
+    │                       └── in-app.adapter.ts
     └── packages/
         ├── database/
         │   ├── package.json
@@ -239,18 +243,20 @@ FILE: apps/notification-service/package.json
     "@prisma/client": "^7.10.0",
     "cors": "^2.8.6",
     "express": "^4.21.0",
+    "nodemailer": "^10.1.2",
     "pg": "^8.23.0",
     "pino": "^9.4.0",
     "pino-http": "^10.3.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
+    "@types/node": "^22.9.0",
+    "@types/nodemailer": "^8.0.2",
     "pino-pretty": "^11.3.0",
     "prisma": "^7.10.0",
     "tsx": "^4.19.1",
-    "@types/cors": "^2.8.17",
-    "@types/node": "^22.9.0",
     "typescript": "^5.6.3"
   }
 }
@@ -369,7 +375,15 @@ const envSchema = z.object({
           .string()
           .min(1)
           .transform((value) => value.split(",").map((origin) => origin.trim())),
+  EMAIL_ENABLED: z
+      .enum(["true", "false"])
+      .default("true")
+      .transform((v) => v === "true"),
+    SMTP_HOST: z.string().default("localhost"),
+    SMTP_PORT: z.coerce.number().default(1025),
+    SMTP_FROM: z.string().default("noreply@notification.local"),
 });
+
 
 const parsed = envSchema.safeParse(process.env);
 
@@ -640,11 +654,23 @@ export const validate =
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.container.ts
 ================================================
+import type { DeliveryChannel } from "@notification/database";
 import { NotificationRepository } from "./notification.repository";
 import { NotificationService } from "./notification.service";
+import { ChannelAdapter } from "./adapters/channel-adapter.interface";
+import { InAppAdapter } from "./adapters/in-app.adapter.js";
+import { EmailAdapter } from "./adapters/email.adapter";
 
-const notificationRepository=new NotificationRepository();
-export const notificationService=new NotificationService(notificationRepository)
+const notificationRepository = new NotificationRepository();
+const adapters = new Map<DeliveryChannel, ChannelAdapter>([
+  ["IN_APP", new InAppAdapter()],
+  ["EMAIL", new EmailAdapter()],
+]);
+export const notificationService = new NotificationService(
+  notificationRepository,
+  adapters,
+);
+
 
 
 ================================================
@@ -702,20 +728,31 @@ export const markAsRead = asyncHandler(async (req: Request, res: Response) => {
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.interface.ts
 ================================================
-import { Notification } from "@notification/database";
-import { CreateNotificationWriteData } from "./notification.types";
+import { Delivery, Notification, type NotificationStatus } from "@notification/database";
+import { CreateNotificationWriteData, NotificationWithDeliveries,UpdateDeliveryData } from "./notification.types";
 
 export interface NotificationInterface{
-  create(data: CreateNotificationWriteData): Promise<Notification>
+  create(data: CreateNotificationWriteData): Promise<NotificationWithDeliveries>
    findByUserId(params: {
     userId: string;
     tenantId?: string;
     page: number;
     limit: number;
     unreadOnly?: boolean;
-  }): Promise<{ data: Notification[]; total: number }>
+   }): Promise<{ data: Notification[]; total: number }>
+  
   findById(id: string): Promise<Notification | null>
-  markAsRead(id:string):Promise<Notification|null>
+  
+  /** Includes deliveries â€“ useful for debugging / roll-up */
+  findByIdWithDeliveries(id: string): Promise<NotificationWithDeliveries | null>;
+  
+  markAsRead(id: string): Promise<Notification>
+  updateDelivery(deliveryId: string, data: UpdateDeliveryData): Promise<Delivery>
+  
+  getDeliveriesByNotificationId(notificationId: string): Promise<Delivery[]>
+  
+  updateNotificationStatus(id:string,status:NotificationStatus):Promise<Notification>
+  
 }
 
 
@@ -723,16 +760,32 @@ export interface NotificationInterface{
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.repository.ts
 ================================================
-import { Notification } from "@notification/database";
+import { Delivery, Notification, NotificationStatus } from "@notification/database";
 import { NotificationInterface } from "./notification.interface.js";
-import { CreateNotificationWriteData } from "./notification.types.js";
+import { CreateNotificationWriteData, NotificationWithDeliveries, UpdateDeliveryData } from "./notification.types.js";
 import { prisma } from "../../infrastructure/prisma.js";
 
 export class NotificationRepository implements NotificationInterface {
-  async create(data: CreateNotificationWriteData): Promise<Notification> {
-    return prisma.notification.create({
-      data
-    });
+  async create(data: CreateNotificationWriteData): Promise<NotificationWithDeliveries> {
+    const { channels, status, ...notificationData } = data
+    return prisma.$transaction(async (tx) => {
+      const notification = await tx.notification.create({
+        data: {
+          ...notificationData,
+          status: status ?? "PENDING",
+          deliveries: {
+            create: channels.map((channel) => ({
+              channel,
+              status: "QUEUED",
+              maxAttempts:3
+            }))
+          }
+        },
+        include:{deliveries:true}
+        
+      })
+      return notification;
+    })
   }
 
   async findByUserId(params: {
@@ -776,10 +829,35 @@ export class NotificationRepository implements NotificationInterface {
       where:{id}
     })
     }
-  async markAsRead(id: string): Promise<Notification | null> {
+
+  async findByIdWithDeliveries(id: string): Promise<NotificationWithDeliveries | null> {
+    return prisma.notification.findUnique({
+      where: { id },
+      include:{deliveries:true}
+    })
+  }
+  async markAsRead(id: string): Promise<Notification > {
     return prisma.notification.update({
       where: { id },
       data:{readAt:new Date()}
+    })
+  }
+  async updateDelivery(deliveryId: string, data: UpdateDeliveryData): Promise<Delivery> {
+    return prisma.delivery.update({
+      where: { id: deliveryId },
+      data
+    })
+  }
+  async updateNotificationStatus(id: string, status: NotificationStatus): Promise<Notification> {
+    return prisma.notification.update({
+      where: { id },
+      data:{status}
+    })
+  }
+  async getDeliveriesByNotificationId(notificationId: string): Promise<Delivery[]> {
+    return prisma.delivery.findMany({
+      where: { id: notificationId },
+      orderBy: { createdAt: "asc" },
     })
   }
 }
@@ -805,13 +883,13 @@ import {
 const router = express.Router();
 
 router
-  .route("/create")
+  .route("/")
   .post(validate(CreateNotificationBodySchema), createNotification);
 router
   .route("/")
   .get(validate(GetUserNotificationsQuerySchema, "query"), userNotifications);
 router.route("/:id").get(findById);
-router.route("/:id/mark").patch(markAsRead);
+router.route("/:id/read").patch(markAsRead);
 
 export default router;
 
@@ -820,7 +898,6 @@ export default router;
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.schema.ts
 ================================================
-import { NotificationStatus } from "@notification/shared-types";
 import { z } from "zod"
 
 export const CreateNotificationBodySchema = z.object({
@@ -851,25 +928,157 @@ export type GetUserNotificationsQuery = z.infer<typeof GetUserNotificationsQuery
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.service.ts
 ================================================
-import { NotFoundError, ValidationError } from "@notification/shared-utils";
-import { NotificationInterface } from "./notification.interface.js";
-import { CreateNotificationInput } from "./notification.schema";
+import {
+  NotFoundError,
+  ValidationError,
+} from "@notification/shared-utils";
+import type {
+  Delivery,
+  DeliveryChannel,
+  NotificationStatus,
+} from "@notification/database";
+import type { NotificationInterface } from "./notification.interface.js";
+import type { CreateNotificationInput } from "./notification.schema.js";
+import type { ChannelAdapter } from "./adapters/channel-adapter.interface.js";
+import { logger } from "../../config/logger.js";
+
+const DEFAULT_CHANNELS: DeliveryChannel[] = ["IN_APP", "EMAIL"];
 
 export class NotificationService {
-  constructor(private readonly repo: NotificationInterface) {}
+  constructor(
+    private readonly repo: NotificationInterface,
+    private readonly adapters: Map<DeliveryChannel, ChannelAdapter>,
+  ) {}
 
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // CREATE (Phase 2 â€“ sync fan-out)
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   async create(input: CreateNotificationInput) {
-    return this.repo.create({
+    // 1. Persist Notification + Deliveries (QUEUED) in one transaction
+    const notification = await this.repo.create({
       userId: input.userId,
       tenantId: input.tenantId ?? null,
       type: input.type,
       title: input.title,
       body: input.body,
       data: input.data ?? undefined,
-      status: "DELIVERED",
+      status: "PENDING",
+      channels: DEFAULT_CHANNELS,
     });
+
+    // 2. Process each delivery synchronously
+    for (const delivery of notification.deliveries) {
+      await this.processDelivery(notification, delivery);
+    }
+
+    // 3. Roll-up Notification status from all deliveries
+    const finalStatus = await this.rollUpStatus(notification.id);
+    await this.repo.updateNotificationStatus(notification.id, finalStatus);
+
+    // 4. Return the full picture
+    const result = await this.repo.findByIdWithDeliveries(notification.id);
+    if (!result) {
+      // should never happen
+      throw new NotFoundError("Notification", notification.id);
+    }
+
+    logger.info("Notification created and processed", {
+      notificationId: result.id,
+      status: result.status,
+      deliveries: result.deliveries.map((d) => ({
+        channel: d.channel,
+        status: d.status,
+      })),
+    });
+
+    return result;
   }
 
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Delivery processing helper
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  private async processDelivery(
+    notification: { id: string; userId: string; title: string; body: string; data: unknown },
+    delivery: Delivery,
+  ): Promise<void> {
+    const adapter = this.adapters.get(delivery.channel);
+
+    if (!adapter) {
+      await this.repo.updateDelivery(delivery.id, {
+        status: "FAILED",
+        attempts: delivery.attempts + 1,
+        lastError: `No adapter registered for channel ${delivery.channel}`,
+      });
+      return;
+    }
+
+    // Mark as SENDING
+    await this.repo.updateDelivery(delivery.id, {
+      status: "SENDING",
+      attempts: delivery.attempts + 1,
+    });
+
+    try {
+      const result = await adapter.send({
+        notificationId: notification.id,
+        userId: notification.userId,
+        title: notification.title,
+        body: notification.body,
+        data: notification.data ?? undefined,
+        // toEmail can be added later when you have a user service
+      });
+
+      await this.repo.updateDelivery(delivery.id, {
+        status: "SENT",
+        sentAt: new Date(),
+        providerMessageId: result.providerMessageId ?? null,
+        lastError: null,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Delivery failed", {
+        notificationId: notification.id,
+        deliveryId: delivery.id,
+        channel: delivery.channel,
+        error: message,
+      });
+
+      await this.repo.updateDelivery(delivery.id, {
+        status: "FAILED",
+        lastError: message,
+      });
+    }
+  }
+
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Status roll-up
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  private async rollUpStatus(notificationId: string): Promise<NotificationStatus> {
+    const deliveries = await this.repo.getDeliveriesByNotificationId(notificationId);
+
+    if (deliveries.length === 0) {
+      return "FAILED";
+    }
+
+    const allSent = deliveries.every((d) => d.status === "SENT");
+    const allFailed = deliveries.every(
+      (d) => d.status === "FAILED" || d.status === "DEAD",
+    );
+    const anySent = deliveries.some((d) => d.status === "SENT");
+    const anyPending = deliveries.some(
+      (d) => d.status === "QUEUED" || d.status === "SENDING",
+    );
+
+    if (anyPending) return "PENDING";
+    if (allSent) return "DELIVERED";
+    if (allFailed) return "FAILED";
+    if (anySent) return "PARTIAL"; // mixed success + failure
+    return "FAILED";
+  }
+
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Existing read APIs (unchanged behaviour)
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   async getUserNotifications(params: {
     userId: string;
     tenantId?: string;
@@ -897,42 +1106,65 @@ export class NotificationService {
         page,
         limit,
         total,
-        totalPages: Math.ceil(total / limit),
+        totalPages: Math.ceil(total / limit) || 0,
       },
     };
   }
+
   async findNotificationById(id: string) {
     if (!id) {
-      throw new NotFoundError("NotificationId not found");
+      throw new ValidationError("Notification id is required");
     }
+
     const notification = await this.repo.findById(id);
     if (!notification) {
       throw new NotFoundError("Notification", id);
     }
     return notification;
   }
+
+  /** Optional: return notification + deliveries (useful for debugging) */
+  async findNotificationByIdWithDeliveries(id: string) {
+    if (!id) {
+      throw new ValidationError("Notification id is required");
+    }
+
+    const notification = await this.repo.findByIdWithDeliveries(id);
+    if (!notification) {
+      throw new NotFoundError("Notification", id);
+    }
+    return notification;
+  }
+
   async markAsRead(id: string) {
     if (!id) {
       throw new ValidationError("Notification id is required");
     }
+
     const notification = await this.repo.findById(id);
     if (!notification) {
       throw new NotFoundError("Notification", id);
     }
+
     // Idempotent: already read â†’ just return it
     if (notification.readAt) {
       return notification;
     }
-    return notification;
+
+    return this.repo.markAsRead(id);
   }
 }
-
 
 
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.types.ts
 ================================================
-import type { NotificationStatus, Prisma } from "@notification/database";
+import type {
+  DeliveryChannel,
+  DeliveryStatus,
+  NotificationStatus,
+  Prisma,
+} from "@notification/database";
 
 export type CreateNotificationWriteData = {
   userId: string;
@@ -941,7 +1173,126 @@ export type CreateNotificationWriteData = {
   type: string;
   body: string;
   data?: Prisma.InputJsonValue;
-  status:NotificationStatus
+  status?: NotificationStatus;
+  channels: DeliveryChannel[];
+};
+export type CreateDeliveryWriteData = {
+  notificationId: string;
+  channel: DeliveryChannel;
+  status?: DeliveryStatus;
+  maxAttempts: number;
+};
+
+export type UpdateDeliveryData = {
+  status?: DeliveryStatus;
+  attempts?: number;
+  lastError?: string | null;
+  providerMessageId?: string | null;
+  sentAt?: Date | null;
+};
+
+export type NotificationWithDeliveries = Prisma.NotificationGetPayload<{
+  include: { deliveries: true };
+}>;
+
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/adapters/channel-adapter.interface.ts
+================================================
+import type { DeliveryChannel } from "@notification/database";
+
+export type SendPayload = {
+  notificationId: string;
+  userId: string;
+  data?: unknown;
+  body: string;
+  toEmail?: string;
+  title:string
+}
+
+export type SendResult = {
+  providerMessageId:string
+}
+export interface ChannelAdapter{
+  readonly channel:DeliveryChannel
+   send(payload:SendPayload):Promise<SendResult>
+ }
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/adapters/email.adapter.ts
+================================================
+import { DeliveryChannel } from "@notification/database";
+import { ChannelAdapter, SendPayload, SendResult } from "./channel-adapter.interface.js";
+import nodemailer, { Transporter } from "nodemailer";
+import { config } from "../../../config";
+import { logger } from "../../../config/logger";
+
+export class EmailAdapter implements ChannelAdapter{
+  readonly channel: DeliveryChannel = "EMAIL";
+  private transporter: Transporter | null = null;
+
+  private getTransporter(): Transporter{
+    if (!this.transporter) {
+      this.transporter = nodemailer.createTransport({
+        host: config.SMTP_HOST,
+        port: config.SMTP_PORT,
+        secure:false
+      })
+    }
+    return this.transporter
+  }
+  async send(payload: SendPayload): Promise<SendResult> {
+    const to = payload.toEmail ?? `${payload.userId}@example.com`;
+    if (!config.EMAIL_ENABLED) {
+          logger.info("EmailAdapter: EMAIL_ENABLED=false â€“ skipping real send", {
+            notificationId: payload.notificationId,
+            to,
+            title: payload.title,
+          });
+          return { providerMessageId: `console-${Date.now()}` };
+    }
+    const transporter = this.getTransporter();
+    const info = await transporter.sendMail({
+      from: config.SMTP_FROM,
+      to,
+      subject: payload.title,
+      text: payload.body,
+      html: `<p>${payload.body}</p>`,
+            // optional: headers for correlation
+            headers: {
+              "X-Notification-Id": payload.notificationId,
+            },
+    })
+    logger.info("EmailAdapter: message sent", {
+          notificationId: payload.notificationId,
+          to,
+          messageId: info.messageId,
+        });
+    
+        return { providerMessageId: info.messageId };
+  }
+}
+
+
+================================================
+FILE: apps/notification-service/src/modules/notification/adapters/in-app.adapter.ts
+================================================
+import { DeliveryChannel } from "@notification/database";
+import { ChannelAdapter, SendPayload, SendResult } from "./channel-adapter.interface.js";
+import { logger } from "../../../config/logger";
+
+export class InAppAdapter implements ChannelAdapter{
+  readonly channel: DeliveryChannel = "IN_APP";
+  async send(payload: SendPayload): Promise<SendResult> {
+    // In-app is just a record in the DB. Nothing to push externally in Phase 2.
+        logger.debug("InAppAdapter: delivery recorded", {
+          notificationId: payload.notificationId,
+          userId: payload.userId,
+        });
+        return {providerMessageId:""}; // no providerMessageId
+  }
 }
 
 
@@ -1038,12 +1389,27 @@ datasource db {
 enum NotificationStatus{
 PENDING
 DELIVERED
+PARTIAL
 FAILED
+}
+
+enum DeliveryChannel{
+IN_APP
+EMAIL
+SMS
+PUSH
+}
+enum DeliveryStatus{
+QUEUED
+SENDING
+SENT
+FAILED
+DEAD
 }
 
 model Notification{
 id                   String          @id @default(uuid())
-status                NotificationStatus    @default(DELIVERED)
+status                NotificationStatus    @default(PENDING)
 userId                 String
 body                String
 createdAt               DateTime          @default(now())
@@ -1052,11 +1418,31 @@ tenantId                 String?
 type                      String
 title                      String
 data                        Json?
-updatedAt DateTime           @updatedAt
-
+updatedAt                   DateTime           @updatedAt
+  
 @@index([userId,createdAt])
 @@index([tenantId,userId])
+deliveries      Delivery[]
+}
 
+model Delivery{
+id                          String     @id @default(uuid())
+notificationId               String
+channel                       DeliveryChannel
+status                         DeliveryStatus   @default(QUEUED)
+attempts                        Int              @default(0)
+maxAttempts                      Int              @default(3)
+lastError                         String?
+providerMessageId                  String?
+sentAt                              DateTime?
+createdAt                          DateTime  @default(now())
+updatedAt                           DateTime  @updatedAt
+
+notification           Notification @relation(fields:[notificationId],references:[id],onDelete:Cascade)
+
+@@unique([notificationId,channel])
+@@index([status, createdAt])
+@@index([notificationId])
 }
 
 
@@ -1090,6 +1476,9 @@ export type {
   NotificationStatus,
   Prisma,
   Notification,
+  Delivery,
+  DeliveryStatus,
+  DeliveryChannel
 } from "./generated/prisma/client.js";
 
 
@@ -1099,7 +1488,10 @@ FILE: packages/database/src/index.ts
 ================================================
 export { PrismaClient, createPrismaClient } from "./client.js"
 
-export type{Prisma,Notification,NotificationStatus} from "./client.js"
+export type{Prisma,Notification,NotificationStatus,Delivery,
+DeliveryStatus,
+DeliveryChannel } from "./client.js"
+
 
 
 ================================================
@@ -1136,7 +1528,24 @@ export enum NotificationStatus {
   
   PENDING = "PENDING",
   DELIVERED = "DELIVERED",
+  PARTIAL="PARTIAL",
   FAILED="FAILED"
+}
+
+export enum DeliveryChannel {
+  IN_APP = "IN_APP",
+  EMAIL = "EMAIL",
+  SMS = "SMS",
+  PUSH = "PUSH",
+}
+
+export enum DeliveryStatus{
+  QUEUED = "QUEUED",
+  SENDING = "SENDING",
+  SENT = "SENT",
+  
+  FAILED = "FAILED",
+  DEAD="DEAD"
 }
 
 
@@ -1209,35 +1618,32 @@ export class NotFoundError extends AppError {
     this.name = "NotFoundError";
   }
 }
+
 export class BadRequestError extends AppError {
-  constructor(message = "Bad Request", code = "BAD_REQUEST") {
-    super("BAD_REQUEST_ERROR",message, 400, code);
+  constructor(message = "Bad Request", details?: unknown) {
+    super("BAD_REQUEST", message, 400, details);
+    this.name = "BadRequestError";
   }
 }
 
-export class UnauthorizedError extends AppError {
-  constructor(message = "Unauthorized", code = "UNAUTHORIZED") {
-    super("UNAUTHORIZED_ERROR",message, 401, code);
-  }
-}
-
-export class ForbiddenError extends AppError {
-  constructor(message = "Forbidden", code = "FORBIDDEN") {
-    super("FORBIDDEN_ERROR",message, 403, code);
-  }
-}
-
-
-
-export class InternalServerError extends AppError {
-  constructor(message = "Internal Server Error", code = "INTERNAL_SERVER_ERROR") {
-    super("INTERNAL_SERVICE_ERROR",message, 500, code);
-  }
-}
 export class ValidationError extends AppError {
   constructor(message: string, details?: unknown) {
     super("VALIDATION_ERROR", message, 400, details);
     this.name = "ValidationError";
+  }
+}
+
+export class UnauthorizedError extends AppError {
+  constructor(message = "Unauthorized", details?: unknown) {
+    super("UNAUTHORIZED", message, 401, details);
+    this.name = "UnauthorizedError";
+  }
+}
+
+export class ForbiddenError extends AppError {
+  constructor(message = "Forbidden", details?: unknown) {
+    super("FORBIDDEN", message, 403, details);
+    this.name = "ForbiddenError";
   }
 }
 
@@ -1252,7 +1658,7 @@ export class InvalidStateTransitionError extends AppError {
   constructor(from: string, to: string) {
     super(
       "INVALID_STATE_TRANSITION",
-      `Cannot transition job from ${from} to ${to}`,
+      `Cannot transition from ${from} to ${to}`,
       409,
     );
     this.name = "InvalidStateTransitionError";
@@ -1273,7 +1679,6 @@ export class PermanentError extends AppError {
   }
 }
 
-/** HTTP 429 â€“ too many requests in the current window */
 export class RateLimitError extends AppError {
   constructor(
     message = "Rate limit exceeded",
@@ -1282,6 +1687,13 @@ export class RateLimitError extends AppError {
   ) {
     super("RATE_LIMITED", message, 429, details);
     this.name = "RateLimitError";
+  }
+}
+
+export class InternalServerError extends AppError {
+  constructor(message = "Internal Server Error", details?: unknown) {
+    super("INTERNAL_SERVER_ERROR", message, 500, details);
+    this.name = "InternalServerError";
   }
 }
 
