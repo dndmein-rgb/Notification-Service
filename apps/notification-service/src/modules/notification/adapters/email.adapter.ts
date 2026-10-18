@@ -1,8 +1,8 @@
 import { DeliveryChannel } from "@notification/database";
 import { ChannelAdapter, SendPayload, SendResult } from "./channel-adapter.interface.js";
 import nodemailer, { Transporter } from "nodemailer";
-import { config } from "../../../config";
-import { logger } from "../../../config/logger";
+import { config } from "../../../config/index.js";
+import { logger } from "../../../config/logger.js";
 
 export class EmailAdapter implements ChannelAdapter{
   readonly channel: DeliveryChannel = "EMAIL";

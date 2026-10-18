@@ -1,0 +1,21 @@
+{
+  "name": "@notification/worker",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@notification/database": "*",
+    "@notification/shared-utils": "*",
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "bullmq": "^5.x",
+    "ioredis": "^5.x",
+    "nodemailer": "^10.x",
+    "pg": "^8.x",
+    "pino": "^9.x",
+    "zod": "^4.x"
+  }
+}
