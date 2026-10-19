@@ -1,5 +1,3 @@
-// notification.service.ts
-
 import {
   NotFoundError,
   ValidationError,
@@ -9,6 +7,7 @@ import type { NotificationInterface } from "./notification.interface.js";
 import type { CreateNotificationInput } from "./notification.schema.js";
 import { enqueueDelivery } from "../../infrastructure/queue.js";
 import { logger } from "../../config/logger.js";
+import { preferenceService } from "../preference/preference.container.js";
 
 const DEFAULT_CHANNELS: DeliveryChannel[] = ["IN_APP", "EMAIL"];
 
@@ -16,7 +15,14 @@ export class NotificationService {
   constructor(private readonly repo: NotificationInterface) {}
 
   async create(input: CreateNotificationInput) {
-    // 1. Persist Notification + Deliveries (QUEUED) in one TX
+    // 1. Resolve channels against user preferences
+        //    - missing pref = enabled (opt-out)
+        //    - IN_APP always kept
+        //    - disabled channels are skipped (no Delivery row)
+        const channels = await preferenceService.resolveChannels(
+              input.userId,
+              DEFAULT_CHANNELS,
+            );
     const notification = await this.repo.create({
       userId: input.userId,
       tenantId: input.tenantId ?? null,
@@ -25,7 +31,7 @@ export class NotificationService {
       body: input.body,
       data: input.data ?? undefined,
       status: "PENDING",
-      channels: DEFAULT_CHANNELS,
+      channels,
     });
 
     // 2. Enqueue one job per delivery (after TX committed)

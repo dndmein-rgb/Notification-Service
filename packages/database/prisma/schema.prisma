@@ -40,7 +40,7 @@ type                      String
 title                      String
 data                        Json?
 updatedAt                   DateTime           @updatedAt
-  
+
 @@index([userId,createdAt])
 @@index([tenantId,userId])
 deliveries      Delivery[]
@@ -64,4 +64,16 @@ notification           Notification @relation(fields:[notificationId],references
 @@unique([notificationId,channel])
 @@index([status, createdAt])
 @@index([notificationId])
+}
+
+model NotificationPreference{
+id                    String        @id @default(uuid())
+userId                String
+channel                DeliveryChannel
+enabled                Boolean         @default(true)
+createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  @@unique([userId,channel])
+  @@index([userId])
 }
