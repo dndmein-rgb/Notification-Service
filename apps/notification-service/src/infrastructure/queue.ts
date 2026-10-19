@@ -14,20 +14,31 @@ const connection = new IORedis(config.REDIS_URL, {
   maxRetriesPerRequest: null,
 });
 
-export const deliveryQueue = new Queue<ProcessDeliveryJob>(DELIVERY_QUEUE_NAME, {
-  connection,
-});
+export const deliveryQueue = new Queue<ProcessDeliveryJob>(
+  DELIVERY_QUEUE_NAME,
+  {
+    connection,
+  },
+);
 
 /**
- * Enqueue one delivery job.
- * Call this AFTER the DB transaction that created the Delivery row has committed.
+ * Enqueue one delivery job (create path + admin retry).
  */
+export async function enqueueDelivery(
+  deliveryId: string,
+  delayMs = 0,
+): Promise<void> {
+  const jobId = `delivery-${deliveryId}-${Date.now()}`;
 
-export async function enqueueDelivery(deliveryId: string): Promise<void>{
-  await deliveryQueue.add(DELIVERY_JOB_NAME, { deliveryId }, {
-    jobId: `delivery-${deliveryId}`,// idempotent: same deliveryId → same job
-    removeOnComplete: 1000,
-    removeOnFail:5000
-  })
-  logger.debug("Enqueued delivery job", { deliveryId });
+  await deliveryQueue.add(
+    DELIVERY_JOB_NAME,
+    { deliveryId },
+    {
+      jobId,
+      delay: delayMs > 0 ? delayMs : undefined,
+      removeOnComplete: 1000,
+      removeOnFail: 5000,
+    },
+  );
+  logger.debug("Enqueued delivery job", { deliveryId, delayMs, jobId });
 }

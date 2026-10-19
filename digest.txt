@@ -5,37 +5,56 @@ Directory structure:
     ├── tsconfig.base.json
     ├── .env.example
     ├── apps/
-    │   └── notification-service/
+    │   ├── notification-service/
+    │   │   ├── package.json
+    │   │   ├── tsconfig.json
+    │   │   ├── .env.example
+    │   │   └── src/
+    │   │       ├── app.ts
+    │   │       ├── server.ts
+    │   │       ├── config/
+    │   │       │   ├── index.ts
+    │   │       │   └── logger.ts
+    │   │       ├── infrastructure/
+    │   │       │   ├── prisma.ts
+    │   │       │   └── queue.ts
+    │   │       ├── middlewares/
+    │   │       │   ├── cors.middleware.ts
+    │   │       │   ├── error.middleware.ts
+    │   │       │   ├── req.middleware.ts
+    │   │       │   └── validate.middleware.ts
+    │   │       └── modules/
+    │   │           └── notification/
+    │   │               ├── notification.container.ts
+    │   │               ├── notification.controller.ts
+    │   │               ├── notification.interface.ts
+    │   │               ├── notification.repository.ts
+    │   │               ├── notification.route.ts
+    │   │               ├── notification.schema.ts
+    │   │               ├── notification.service.ts
+    │   │               ├── notification.types.ts
+    │   │               └── adapters/
+    │   │                   ├── channel-adapter.interface.ts
+    │   │                   ├── email.adapter.ts
+    │   │                   └── in-app.adapter.ts
+    │   └── notification-worker/
     │       ├── package.json
     │       ├── tsconfig.json
     │       ├── .env.example
     │       └── src/
-    │           ├── app.ts
-    │           ├── server.ts
+    │           ├── index.ts
+    │           ├── adapters/
+    │           │   ├── channel-adapter.interface.ts
+    │           │   ├── email.adapter.ts
+    │           │   └── in-app.adapter.ts
     │           ├── config/
     │           │   ├── index.ts
     │           │   └── logger.ts
     │           ├── infrastructure/
-    │           │   └── prisma.ts
-    │           ├── middlewares/
-    │           │   ├── cors.middleware.ts
-    │           │   ├── error.middleware.ts
-    │           │   ├── req.middleware.ts
-    │           │   └── validate.middleware.ts
-    │           └── modules/
-    │               └── notification/
-    │                   ├── notification.container.ts
-    │                   ├── notification.controller.ts
-    │                   ├── notification.interface.ts
-    │                   ├── notification.repository.ts
-    │                   ├── notification.route.ts
-    │                   ├── notification.schema.ts
-    │                   ├── notification.service.ts
-    │                   ├── notification.types.ts
-    │                   └── adapters/
-    │                       ├── channel-adapter.interface.ts
-    │                       ├── email.adapter.ts
-    │                       └── in-app.adapter.ts
+    │           │   ├── prisma.ts
+    │           │   └── queue.ts
+    │           └── processors/
+    │               └── delivery.processor.ts
     └── packages/
         ├── database/
         │   ├── package.json
@@ -298,6 +317,8 @@ KAFKA_BROKERS=localhost:9092
 ADMIN_API_KEY=dev-admin-key-change-me
 
 # Mailhog (later)
+EMAIL_ENABLED=true
+SMTP_FROM=noreply@notification.local
 SMTP_HOST=localhost
 SMTP_PORT=1025
 
@@ -520,6 +541,45 @@ prisma.$on("query" as never, (e: { query: string; duration: number }) => {
 
 
 ================================================
+FILE: apps/notification-service/src/infrastructure/queue.ts
+================================================
+import { Queue } from "bullmq";
+import IORedis from "ioredis";
+import { config } from "../config/index.js";
+import { logger } from "../config/logger.js";
+
+export const DELIVERY_QUEUE_NAME = "notification-deliveries";
+export const DELIVERY_JOB_NAME = "process-delivery";
+
+export type ProcessDeliveryJob = {
+  deliveryId: string;
+};
+
+const connection = new IORedis(config.REDIS_URL, {
+  maxRetriesPerRequest: null,
+});
+
+export const deliveryQueue = new Queue<ProcessDeliveryJob>(DELIVERY_QUEUE_NAME, {
+  connection,
+});
+
+/**
+ * Enqueue one delivery job.
+ * Call this AFTER the DB transaction that created the Delivery row has committed.
+ */
+
+export async function enqueueDelivery(deliveryId: string): Promise<void>{
+  await deliveryQueue.add(DELIVERY_JOB_NAME, { deliveryId }, {
+    jobId: `delivery-${deliveryId}`,// idempotent: same deliveryId â†’ same job
+    removeOnComplete: 1000,
+    removeOnFail:5000
+  })
+  logger.debug("Enqueued delivery job", { deliveryId });
+}
+
+
+
+================================================
 FILE: apps/notification-service/src/middlewares/cors.middleware.ts
 ================================================
 import cors from "cors";
@@ -654,21 +714,13 @@ export const validate =
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.container.ts
 ================================================
-import type { DeliveryChannel } from "@notification/database";
-import { NotificationRepository } from "./notification.repository";
-import { NotificationService } from "./notification.service";
-import { ChannelAdapter } from "./adapters/channel-adapter.interface";
-import { InAppAdapter } from "./adapters/in-app.adapter.js";
-import { EmailAdapter } from "./adapters/email.adapter";
+import { NotificationRepository } from "./notification.repository.js";
+import { NotificationService } from "./notification.service.js";
+
 
 const notificationRepository = new NotificationRepository();
-const adapters = new Map<DeliveryChannel, ChannelAdapter>([
-  ["IN_APP", new InAppAdapter()],
-  ["EMAIL", new EmailAdapter()],
-]);
 export const notificationService = new NotificationService(
   notificationRepository,
-  adapters,
 );
 
 
@@ -856,7 +908,7 @@ export class NotificationRepository implements NotificationInterface {
   }
   async getDeliveriesByNotificationId(notificationId: string): Promise<Delivery[]> {
     return prisma.delivery.findMany({
-      where: { id: notificationId },
+      where: { notificationId },
       orderBy: { createdAt: "asc" },
     })
   }
@@ -928,33 +980,25 @@ export type GetUserNotificationsQuery = z.infer<typeof GetUserNotificationsQuery
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.service.ts
 ================================================
+// notification.service.ts
+
 import {
   NotFoundError,
   ValidationError,
 } from "@notification/shared-utils";
-import type {
-  Delivery,
-  DeliveryChannel,
-  NotificationStatus,
-} from "@notification/database";
+import type { DeliveryChannel } from "@notification/database";
 import type { NotificationInterface } from "./notification.interface.js";
 import type { CreateNotificationInput } from "./notification.schema.js";
-import type { ChannelAdapter } from "./adapters/channel-adapter.interface.js";
+import { enqueueDelivery } from "../../infrastructure/queue.js";
 import { logger } from "../../config/logger.js";
 
 const DEFAULT_CHANNELS: DeliveryChannel[] = ["IN_APP", "EMAIL"];
 
 export class NotificationService {
-  constructor(
-    private readonly repo: NotificationInterface,
-    private readonly adapters: Map<DeliveryChannel, ChannelAdapter>,
-  ) {}
+  constructor(private readonly repo: NotificationInterface) {}
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // CREATE (Phase 2 â€“ sync fan-out)
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   async create(input: CreateNotificationInput) {
-    // 1. Persist Notification + Deliveries (QUEUED) in one transaction
+    // 1. Persist Notification + Deliveries (QUEUED) in one TX
     const notification = await this.repo.create({
       userId: input.userId,
       tenantId: input.tenantId ?? null,
@@ -966,119 +1010,20 @@ export class NotificationService {
       channels: DEFAULT_CHANNELS,
     });
 
-    // 2. Process each delivery synchronously
+    // 2. Enqueue one job per delivery (after TX committed)
     for (const delivery of notification.deliveries) {
-      await this.processDelivery(notification, delivery);
+      await enqueueDelivery(delivery.id);
     }
 
-    // 3. Roll-up Notification status from all deliveries
-    const finalStatus = await this.rollUpStatus(notification.id);
-    await this.repo.updateNotificationStatus(notification.id, finalStatus);
-
-    // 4. Return the full picture
-    const result = await this.repo.findByIdWithDeliveries(notification.id);
-    if (!result) {
-      // should never happen
-      throw new NotFoundError("Notification", notification.id);
-    }
-
-    logger.info("Notification created and processed", {
-      notificationId: result.id,
-      status: result.status,
-      deliveries: result.deliveries.map((d) => ({
-        channel: d.channel,
-        status: d.status,
-      })),
+    logger.info("Notification created and jobs enqueued", {
+      notificationId: notification.id,
+      deliveryIds: notification.deliveries.map((d) => d.id),
     });
 
-    return result;
+    // Status is still PENDING; worker will move it to DELIVERED / PARTIAL / FAILED
+    return notification;
   }
 
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Delivery processing helper
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  private async processDelivery(
-    notification: { id: string; userId: string; title: string; body: string; data: unknown },
-    delivery: Delivery,
-  ): Promise<void> {
-    const adapter = this.adapters.get(delivery.channel);
-
-    if (!adapter) {
-      await this.repo.updateDelivery(delivery.id, {
-        status: "FAILED",
-        attempts: delivery.attempts + 1,
-        lastError: `No adapter registered for channel ${delivery.channel}`,
-      });
-      return;
-    }
-
-    // Mark as SENDING
-    await this.repo.updateDelivery(delivery.id, {
-      status: "SENDING",
-      attempts: delivery.attempts + 1,
-    });
-
-    try {
-      const result = await adapter.send({
-        notificationId: notification.id,
-        userId: notification.userId,
-        title: notification.title,
-        body: notification.body,
-        data: notification.data ?? undefined,
-        // toEmail can be added later when you have a user service
-      });
-
-      await this.repo.updateDelivery(delivery.id, {
-        status: "SENT",
-        sentAt: new Date(),
-        providerMessageId: result.providerMessageId ?? null,
-        lastError: null,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.error("Delivery failed", {
-        notificationId: notification.id,
-        deliveryId: delivery.id,
-        channel: delivery.channel,
-        error: message,
-      });
-
-      await this.repo.updateDelivery(delivery.id, {
-        status: "FAILED",
-        lastError: message,
-      });
-    }
-  }
-
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Status roll-up
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  private async rollUpStatus(notificationId: string): Promise<NotificationStatus> {
-    const deliveries = await this.repo.getDeliveriesByNotificationId(notificationId);
-
-    if (deliveries.length === 0) {
-      return "FAILED";
-    }
-
-    const allSent = deliveries.every((d) => d.status === "SENT");
-    const allFailed = deliveries.every(
-      (d) => d.status === "FAILED" || d.status === "DEAD",
-    );
-    const anySent = deliveries.some((d) => d.status === "SENT");
-    const anyPending = deliveries.some(
-      (d) => d.status === "QUEUED" || d.status === "SENDING",
-    );
-
-    if (anyPending) return "PENDING";
-    if (allSent) return "DELIVERED";
-    if (allFailed) return "FAILED";
-    if (anySent) return "PARTIAL"; // mixed success + failure
-    return "FAILED";
-  }
-
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Existing read APIs (unchanged behaviour)
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   async getUserNotifications(params: {
     userId: string;
     tenantId?: string;
@@ -1087,10 +1032,7 @@ export class NotificationService {
     unreadOnly?: boolean;
   }) {
     const { userId, tenantId, page, limit, unreadOnly } = params;
-
-    if (!userId) {
-      throw new ValidationError("userId is required");
-    }
+    if (!userId) throw new ValidationError("userId is required");
 
     const { data, total } = await this.repo.findByUserId({
       userId,
@@ -1112,45 +1054,24 @@ export class NotificationService {
   }
 
   async findNotificationById(id: string) {
-    if (!id) {
-      throw new ValidationError("Notification id is required");
-    }
-
+    if (!id) throw new ValidationError("Notification id is required");
     const notification = await this.repo.findById(id);
-    if (!notification) {
-      throw new NotFoundError("Notification", id);
-    }
+    if (!notification) throw new NotFoundError("Notification", id);
     return notification;
   }
 
-  /** Optional: return notification + deliveries (useful for debugging) */
   async findNotificationByIdWithDeliveries(id: string) {
-    if (!id) {
-      throw new ValidationError("Notification id is required");
-    }
-
+    if (!id) throw new ValidationError("Notification id is required");
     const notification = await this.repo.findByIdWithDeliveries(id);
-    if (!notification) {
-      throw new NotFoundError("Notification", id);
-    }
+    if (!notification) throw new NotFoundError("Notification", id);
     return notification;
   }
 
   async markAsRead(id: string) {
-    if (!id) {
-      throw new ValidationError("Notification id is required");
-    }
-
+    if (!id) throw new ValidationError("Notification id is required");
     const notification = await this.repo.findById(id);
-    if (!notification) {
-      throw new NotFoundError("Notification", id);
-    }
-
-    // Idempotent: already read â†’ just return it
-    if (notification.readAt) {
-      return notification;
-    }
-
+    if (!notification) throw new NotFoundError("Notification", id);
+    if (notification.readAt) return notification;
     return this.repo.markAsRead(id);
   }
 }
@@ -1212,7 +1133,7 @@ export type SendPayload = {
 }
 
 export type SendResult = {
-  providerMessageId:string
+  providerMessageId?:string
 }
 export interface ChannelAdapter{
   readonly channel:DeliveryChannel
@@ -1226,8 +1147,8 @@ FILE: apps/notification-service/src/modules/notification/adapters/email.adapter.
 import { DeliveryChannel } from "@notification/database";
 import { ChannelAdapter, SendPayload, SendResult } from "./channel-adapter.interface.js";
 import nodemailer, { Transporter } from "nodemailer";
-import { config } from "../../../config";
-import { logger } from "../../../config/logger";
+import { config } from "../../../config/index.js";
+import { logger } from "../../../config/logger.js";
 
 export class EmailAdapter implements ChannelAdapter{
   readonly channel: DeliveryChannel = "EMAIL";
@@ -1291,8 +1212,557 @@ export class InAppAdapter implements ChannelAdapter{
           notificationId: payload.notificationId,
           userId: payload.userId,
         });
-        return {providerMessageId:""}; // no providerMessageId
+        return {}; // no providerMessageId
   }
+}
+
+
+================================================
+FILE: apps/notification-worker/package.json
+================================================
+{
+  "name": "@notification/worker",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@notification/database": "*",
+    "@notification/shared-utils": "*",
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "bullmq": "^5.x",
+    "ioredis": "^5.x",
+    "nodemailer": "^10.x",
+    "pg": "^8.x",
+    "pino": "^9.x",
+    "zod": "^4.x"
+  }
+}
+
+
+================================================
+FILE: apps/notification-worker/tsconfig.json
+================================================
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "types":["node"]
+  },
+  "include": ["src"]
+}
+
+
+================================================
+FILE: apps/notification-worker/.env.example
+================================================
+NODE_ENV=development
+LOG_LEVEL=info
+DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
+REDIS_URL=redis://localhost:6379
+EMAIL_ENABLED=true
+SMTP_HOST=localhost
+SMTP_PORT=1025
+SMTP_FROM=noreply@notification.local
+
+
+================================================
+FILE: apps/notification-worker/src/index.ts
+================================================
+import { Worker } from "bullmq";
+import { logger } from "./config/logger.js";
+import { prisma } from "./infrastructure/prisma.js";
+import {
+  createRedisConnection,
+  DELIVERY_QUEUE_NAME,
+  type ProcessDeliveryJob,
+} from "./infrastructure/queue.js";
+import { createDeliveryProcessor } from "./processors/delivery.processor.js";
+import { InAppAdapter } from "./adapters/in-app.adapter.js";
+import { EmailAdapter } from "./adapters/email.adapter.js";
+import type { DeliveryChannel } from "@notification/database";
+import type { ChannelAdapter } from "./adapters/channel-adapter.interface.js";
+
+async function main() {
+  const connection = createRedisConnection();
+
+  const adapters = new Map<DeliveryChannel, ChannelAdapter>([
+    ["IN_APP", new InAppAdapter()],
+    ["EMAIL", new EmailAdapter()],
+  ]);
+
+  const processor = createDeliveryProcessor(adapters);
+
+  const worker = new Worker<ProcessDeliveryJob>(
+    DELIVERY_QUEUE_NAME,
+    processor,
+    {
+      connection,
+      concurrency: 5,
+    },
+  );
+
+  worker.on("completed", (job) => {
+    logger.info("Job completed", { jobId: job.id, deliveryId: job.data.deliveryId });
+  });
+
+  worker.on("failed", (job, err) => {
+    logger.error("Job failed", {
+      jobId: job?.id,
+      deliveryId: job?.data.deliveryId,
+      error: err.message,
+    });
+  });
+
+  logger.info(`notification-worker started (queue=${DELIVERY_QUEUE_NAME})`);
+
+  const shutdown = async (signal: string) => {
+    logger.info(`Shutting down worker (${signal})`);
+    await worker.close();
+    await connection.quit();
+    await prisma.$disconnect();
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+}
+
+main().catch((err) => {
+  logger.error(err, "Failed to start worker");
+  process.exit(1);
+});
+
+
+================================================
+FILE: apps/notification-worker/src/adapters/channel-adapter.interface.ts
+================================================
+import type { DeliveryChannel } from "@notification/database";
+
+export type SendPayload = {
+  notificationId: string;
+  userId: string;
+  data?: unknown;
+  body: string;
+  toEmail?: string;
+  title:string
+}
+
+export type SendResult = {
+  providerMessageId?:string
+}
+export interface ChannelAdapter{
+  readonly channel:DeliveryChannel
+   send(payload:SendPayload):Promise<SendResult>
+ }
+
+
+================================================
+FILE: apps/notification-worker/src/adapters/email.adapter.ts
+================================================
+import { DeliveryChannel } from "@notification/database";
+import { ChannelAdapter, SendPayload, SendResult } from "./channel-adapter.interface.js";
+import nodemailer, { Transporter } from "nodemailer";
+import { config } from "../config/index.js";
+import { logger } from "../config/logger.js";
+
+export class EmailAdapter implements ChannelAdapter{
+  readonly channel: DeliveryChannel = "EMAIL";
+  private transporter: Transporter | null = null;
+
+  private getTransporter(): Transporter{
+    if (!this.transporter) {
+      this.transporter = nodemailer.createTransport({
+        host: config.SMTP_HOST,
+        port: config.SMTP_PORT,
+        secure:false
+      })
+    }
+    return this.transporter
+  }
+  async send(payload: SendPayload): Promise<SendResult> {
+    const to = payload.toEmail ?? `${payload.userId}@example.com`;
+    if (!config.EMAIL_ENABLED) {
+          logger.info("EmailAdapter: EMAIL_ENABLED=false â€“ skipping real send", {
+            notificationId: payload.notificationId,
+            to,
+            title: payload.title,
+          });
+          return { providerMessageId: `console-${Date.now()}` };
+    }
+    const transporter = this.getTransporter();
+    const info = await transporter.sendMail({
+      from: config.SMTP_FROM,
+      to,
+      subject: payload.title,
+      text: payload.body,
+      html: `<p>${payload.body}</p>`,
+            // optional: headers for correlation
+            headers: {
+              "X-Notification-Id": payload.notificationId,
+            },
+    })
+    logger.info("EmailAdapter: message sent", {
+          notificationId: payload.notificationId,
+          to,
+          messageId: info.messageId,
+        });
+    
+        return { providerMessageId: info.messageId };
+  }
+}
+
+
+================================================
+FILE: apps/notification-worker/src/adapters/in-app.adapter.ts
+================================================
+import { DeliveryChannel } from "@notification/database";
+import { ChannelAdapter, SendPayload, SendResult } from "./channel-adapter.interface.js";
+import { logger } from "../config/logger.js";
+
+export class InAppAdapter implements ChannelAdapter{
+  readonly channel: DeliveryChannel = "IN_APP";
+  async send(payload: SendPayload): Promise<SendResult> {
+    // In-app is just a record in the DB. Nothing to push externally in Phase 2.
+        logger.debug("InAppAdapter: delivery recorded", {
+          notificationId: payload.notificationId,
+          userId: payload.userId,
+        });
+        return {}; // no providerMessageId
+  }
+}
+
+
+================================================
+FILE: apps/notification-worker/src/config/index.ts
+================================================
+import "dotenv/config";
+import { z } from "zod";
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
+  LOG_LEVEL: z.string().default("info"),
+  DATABASE_URL: z.string(),
+  REDIS_URL: z.string(),
+
+  EMAIL_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
+  SMTP_HOST: z.string().default("localhost"),
+  SMTP_PORT: z.coerce.number().default(1025),
+  SMTP_FROM: z.string().default("noreply@notification.local"),
+});
+
+const parsed = envSchema.safeParse(process.env);
+if (!parsed.success) {
+  console.error("Invalid environment variables:", parsed.error.flatten().fieldErrors);
+  process.exit(1);
+}
+
+export const config = {
+  ...parsed.data,
+  SERVICE_NAME: "notification-worker",
+} as const;
+
+
+================================================
+FILE: apps/notification-worker/src/config/logger.ts
+================================================
+import pino from "pino";
+import { config } from "./index.js";
+
+const baseLogger = pino({
+  level: config.NODE_ENV === "development" ? "debug" : "info",
+  ...(config.NODE_ENV === "development" && {
+    transport: {
+      target: "pino-pretty",
+      options: {
+        colorize: true,
+        translateTime: "SYS:standard",
+        ignore: "pid,hostname",
+      },
+    },
+  }),
+  base: {
+    service: config.SERVICE_NAME,
+  },
+});
+
+type LogMeta = Record<string, unknown> | Error | unknown;
+
+type LogFn = {
+  (msg: string, meta?: LogMeta): void;
+  (meta: LogMeta, msg?: string): void;
+};
+
+const toMergingObject = (meta?: LogMeta): Record<string, unknown> => {
+  if (meta === undefined || meta === null) {
+    return {};
+  }
+
+  if (meta instanceof Error) {
+    return {
+      err: {
+        message: meta.message,
+        name: meta.name,
+        stack: meta.stack,
+      },
+    };
+  }
+
+  if (typeof meta === "object") {
+    return meta as Record<string, unknown>;
+  }
+
+  // primitive (string/number/boolean) â€“ wrap it
+  return { value: meta };
+};
+
+const createLogFn = (level: "info" | "error" | "warn" | "debug"): LogFn => {
+  return (msgOrMeta: string | LogMeta, maybeMetaOrMsg?: string | LogMeta) => {
+    // Preferred: message first
+    // logger.error("Error during graceful shutdown", error)
+    // logger.info("Member added", { roomId })
+    if (typeof msgOrMeta === "string") {
+      const msg = msgOrMeta;
+      const obj = toMergingObject(maybeMetaOrMsg);
+      baseLogger[level](obj, msg);
+      return;
+    }
+
+    // Also support: object/error first
+    // logger.error(error, "Error during graceful shutdown")
+    // logger.info({ roomId }, "Member added")
+    const obj = toMergingObject(msgOrMeta);
+    const msg = typeof maybeMetaOrMsg === "string" ? maybeMetaOrMsg : undefined;
+
+    if (msg) {
+      baseLogger[level](obj, msg);
+    } else {
+      baseLogger[level](obj);
+    }
+  };
+};
+
+export const logger = {
+  info: createLogFn("info"),
+  error: createLogFn("error"),
+  warn: createLogFn("warn"),
+  debug: createLogFn("debug"),
+  child: baseLogger.child.bind(baseLogger),
+};
+
+
+================================================
+FILE: apps/notification-worker/src/infrastructure/prisma.ts
+================================================
+import pg from "pg";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@notification/database";
+import { config } from "../config/index.js";
+import { logger } from "../config/logger.js";
+
+const pool = new pg.Pool({ connectionString: config.DATABASE_URL });
+const adapter = new PrismaPg(pool);
+
+const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    adapter,
+    log: config.NODE_ENV === "development" ? ["error", "warn"] : ["error"],
+  });
+
+if (config.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+
+prisma.$on("query" as never, (e: { query: string; duration: number }) => {
+  if (config.LOG_LEVEL === "debug") {
+    logger.debug("prisma query", { query: e.query, durationMs: e.duration });
+  }
+});
+
+
+================================================
+FILE: apps/notification-worker/src/infrastructure/queue.ts
+================================================
+import IORedis from "ioredis";
+import { config } from "../config";
+import { ConnectionOptions, Queue } from "bullmq";
+
+export const DELIVERY_QUEUE_NAME = "notification-deliveries"
+export const DELIVERY_JOB_NAME = "process-delivery"
+
+export type ProcessDeliveryJob = {
+  deliveryId: string;
+};
+
+export function createRedisConnection(): IORedis{
+  return new IORedis(config.REDIS_URL, {
+    maxRetriesPerRequest:null
+  })
+}
+
+export function createDeliveryQueue(connection: ConnectionOptions) {
+  return new Queue<ProcessDeliveryJob>(DELIVERY_QUEUE_NAME,{connection})
+}
+
+
+
+================================================
+FILE: apps/notification-worker/src/processors/delivery.processor.ts
+================================================
+import type { Job } from "bullmq";
+import type { DeliveryChannel, NotificationStatus } from "@notification/database";
+import { prisma } from "../infrastructure/prisma.js";
+import type { ProcessDeliveryJob } from "../infrastructure/queue.js";
+import type { ChannelAdapter } from "../adapters/channel-adapter.interface.js";
+import { logger } from "../config/logger.js";
+
+export function createDeliveryProcessor(
+  adapters: Map<DeliveryChannel, ChannelAdapter>,
+) {
+  return async function processDelivery(job: Job<ProcessDeliveryJob>) {
+    const { deliveryId } = job.data;
+
+    logger.info("Processing delivery job", {
+      jobId: job.id,
+      deliveryId,
+    });
+
+    const delivery = await prisma.delivery.findUnique({
+      where: { id: deliveryId },
+      include: { notification: true },
+    });
+
+    if (!delivery) {
+      logger.warn("Delivery not found, skipping", { deliveryId });
+      return;
+    }
+
+    // Idempotency: only process QUEUED
+    if (delivery.status !== "QUEUED") {
+      logger.info("Delivery already processed, skipping", {
+        deliveryId,
+        status: delivery.status,
+      });
+      return;
+    }
+
+    // CAS: QUEUED â†’ SENDING, attempts++
+    const cas = await prisma.delivery.updateMany({
+      where: { id: deliveryId, status: "QUEUED" },
+      data: {
+        status: "SENDING",
+        attempts: { increment: 1 },
+      },
+    });
+
+    if (cas.count === 0) {
+      logger.info("Lost CAS race, skipping", { deliveryId });
+      return;
+    }
+
+    const adapter = adapters.get(delivery.channel);
+    if (!adapter) {
+      await markFailed(deliveryId, `No adapter for channel ${delivery.channel}`);
+      await rollUpNotificationStatus(delivery.notificationId);
+      return;
+    }
+
+    try {
+      const result = await adapter.send({
+        notificationId: delivery.notificationId,
+        userId: delivery.notification.userId,
+        title: delivery.notification.title,
+        body: delivery.notification.body,
+        data: delivery.notification.data ?? undefined,
+      });
+
+      await prisma.delivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: "SENT",
+          sentAt: new Date(),
+          providerMessageId: result.providerMessageId ?? null,
+          lastError: null,
+        },
+      });
+
+      logger.info("Delivery sent", {
+        deliveryId,
+        channel: delivery.channel,
+        providerMessageId: result.providerMessageId,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Delivery send failed", {
+        deliveryId,
+        channel: delivery.channel,
+        error: message,
+      });
+      await markFailed(deliveryId, message);
+    }
+
+    await rollUpNotificationStatus(delivery.notificationId);
+  };
+}
+
+async function markFailed(deliveryId: string, lastError: string) {
+  await prisma.delivery.update({
+    where: { id: deliveryId },
+    data: {
+      status: "FAILED",
+      lastError,
+    },
+  });
+}
+
+async function rollUpNotificationStatus(notificationId: string) {
+  const deliveries = await prisma.delivery.findMany({
+    where: { notificationId },
+  });
+
+  if (deliveries.length === 0) {
+    await prisma.notification.update({
+      where: { id: notificationId },
+      data: { status: "FAILED" },
+    });
+    return;
+  }
+
+  const allSent = deliveries.every((d) => d.status === "SENT");
+  const allFailed = deliveries.every(
+    (d) => d.status === "FAILED" || d.status === "DEAD",
+  );
+  const anySent = deliveries.some((d) => d.status === "SENT");
+  const anyPending = deliveries.some(
+    (d) => d.status === "QUEUED" || d.status === "SENDING",
+  );
+
+  let status: NotificationStatus;
+  if (anyPending) status = "PENDING";
+  else if (allSent) status = "DELIVERED";
+  else if (allFailed) status = "FAILED";
+  else if (anySent) status = "PARTIAL";
+  else status = "FAILED";
+
+  await prisma.notification.update({
+    where: { id: notificationId },
+    data: { status },
+  });
+
+  logger.info("Notification status rolled up", {
+    notificationId,
+    status,
+  });
 }
 
 

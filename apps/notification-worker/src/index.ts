@@ -1,5 +1,4 @@
 import { Worker } from "bullmq";
-import { config } from "./config/index.js";
 import { logger } from "./config/logger.js";
 import { prisma } from "./infrastructure/prisma.js";
 import {

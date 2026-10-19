@@ -1,9 +1,16 @@
 import type { Job } from "bullmq";
-import type { DeliveryChannel, NotificationStatus } from "@notification/database";
+import type {
+  DeliveryChannel,
+  NotificationStatus,
+} from "@notification/database";
 import { prisma } from "../infrastructure/prisma.js";
-import type { ProcessDeliveryJob } from "../infrastructure/queue.js";
+import {
+  enqueueDelivery,
+  type ProcessDeliveryJob,
+} from "../infrastructure/queue.js";
 import type { ChannelAdapter } from "../adapters/channel-adapter.interface.js";
 import { logger } from "../config/logger.js";
+import { calculateBackoffMs } from "@notification/shared-utils";
 
 export function createDeliveryProcessor(
   adapters: Map<DeliveryChannel, ChannelAdapter>,
@@ -49,9 +56,20 @@ export function createDeliveryProcessor(
       return;
     }
 
+    const updated = await prisma.delivery.findUnique({
+      where: { id: deliveryId },
+    });
+    const currentAttempts = updated?.attempts ?? delivery.attempts + 1;
+    const maxAttempts = delivery.maxAttempts;
+
     const adapter = adapters.get(delivery.channel);
     if (!adapter) {
-      await markFailed(deliveryId, `No adapter for channel ${delivery.channel}`);
+      await handleFailure(
+        deliveryId,
+        `No adapter for channel ${delivery.channel}`,
+        currentAttempts,
+        maxAttempts,
+      );
       await rollUpNotificationStatus(delivery.notificationId);
       return;
     }
@@ -87,21 +105,53 @@ export function createDeliveryProcessor(
         channel: delivery.channel,
         error: message,
       });
-      await markFailed(deliveryId, message);
+      await handleFailure(deliveryId, message, currentAttempts, maxAttempts);
     }
 
     await rollUpNotificationStatus(delivery.notificationId);
   };
 }
+/**
+ * attempts < maxAttempts → FAILED then back to QUEUED + delayed re-enqueue
+ * else → DEAD
+ */
+async function handleFailure(
+  deliveryId: string,
+  lastError: string,
+  attempts: number,
+  maxAttempts: number,
+) {
+  if (attempts < maxAttempts) {
+    const delayMs = calculateBackoffMs(attempts);
+    // Mark FAILED (visible), then QUEUED so the delayed job can CAS
+    await prisma.delivery.update({
+      where: { id: deliveryId },
+      data: { status: "FAILED", lastError },
+    });
+    await prisma.delivery.update({
+      where: { id: deliveryId },
+      data: { status: "QUEUED" },
+    });
+    await enqueueDelivery(deliveryId, delayMs, attempts + 1);
+    logger.info("Delivery scheduled for retry", {
+      deliveryId,
+      attempts,
+      maxAttempts,
+      delayMs,
+    });
+  } else {
+    await prisma.delivery.update({
+      where: { id: deliveryId },
+      data: { status: "DEAD", lastError },
+    });
 
-async function markFailed(deliveryId: string, lastError: string) {
-  await prisma.delivery.update({
-    where: { id: deliveryId },
-    data: {
-      status: "FAILED",
+    logger.warn("Delivery moved to DEAD", {
+      deliveryId,
+      attempts,
+      maxAttempts,
       lastError,
-    },
-  });
+    });
+  }
 }
 
 async function rollUpNotificationStatus(notificationId: string) {

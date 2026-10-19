@@ -1,6 +1,6 @@
 import { DeliveryChannel } from "@notification/database";
 import { ChannelAdapter, SendPayload, SendResult } from "./channel-adapter.interface.js";
-import { logger } from "../../../config/logger";
+import { logger } from "../config/logger.js";
 
 export class InAppAdapter implements ChannelAdapter{
   readonly channel: DeliveryChannel = "IN_APP";
