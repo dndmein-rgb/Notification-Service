@@ -3,6 +3,9 @@ import { CreateNotificationWriteData, NotificationWithDeliveries,UpdateDeliveryD
 
 export interface NotificationInterface{
   create(data: CreateNotificationWriteData): Promise<NotificationWithDeliveries>
+
+  findByIdempotencyKey(key:string,tenantId?:string|null):Promise<NotificationWithDeliveries|null>
+  
    findByUserId(params: {
     userId: string;
     tenantId?: string;

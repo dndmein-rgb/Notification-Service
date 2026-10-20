@@ -15,7 +15,7 @@ export class NotificationRepository implements NotificationInterface {
   async create(
     data: CreateNotificationWriteData,
   ): Promise<NotificationWithDeliveries> {
-    const { channels, status, ...notificationData } = data;
+    const { channels, status, idempotencyKey,...notificationData } = data;
     return prisma.$transaction(async (tx) => {
       const notification = await tx.notification.create({
         data: {
@@ -50,11 +50,37 @@ export class NotificationRepository implements NotificationInterface {
           },
         },
       });
+      if (idempotencyKey) {
+            await tx.idempotencyKey.create({
+              data: {
+                key: idempotencyKey,
+                tenantId: notification.tenantId ?? null,
+                notificationId: notification.id,
+              },
+            });
+          }
 
       return notification;
     });
   }
 
+async findByIdempotencyKey(key: string, tenantId?: string | null): Promise<NotificationWithDeliveries | null> {
+  const row = await prisma.idempotencyKey.findFirst({
+        where: {
+          key,
+          ...(tenantId != null && tenantId !== ""
+            ? { tenantId }
+            : { tenantId: null }),
+        },
+      });
+      if (!row) return null;
+  
+      return prisma.notification.findUnique({
+        where: { id: row.notificationId },
+        include: { deliveries: true },
+      });
+}
+  
   async findByUserId(params: {
     userId: string;
     tenantId?: string;

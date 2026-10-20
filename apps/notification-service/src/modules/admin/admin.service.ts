@@ -12,6 +12,7 @@ export class AdminService {
     channel?: string;
     page: number;
     limit: number;
+    tenantId?:string
   }) {
     const { data, total } = await this.repo.listDeliveries(params);
     return {

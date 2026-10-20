@@ -3,6 +3,7 @@ import { Kafka } from "kafkajs";
 import { prisma } from "./prisma.js";
 import { config } from "../config/index.js";
 import { logger } from "../config/logger.js";
+import { outboxPublishedTotal, outboxPublishErrorsTotal } from "./metrics.js";
 
 const TOPIC = "notification.events";
 const BATCH_SIZE = 50;
@@ -13,10 +14,13 @@ const kafka = new Kafka({
   brokers: [config.KAFKA_BROKERS],
 });
 
+let interval: ReturnType<typeof setInterval> | null = null;
+
 const producer = kafka.producer({ idempotent: true });
 
 export async function startOutboxPublisher() {
   await producer.connect();
+  interval = setInterval(() => void tick(), POLL_MS);
 
   const tick = async () => {
     try {
@@ -61,6 +65,7 @@ export async function startOutboxPublisher() {
               lastError: null,
             },
           });
+          outboxPublishedTotal.inc();
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           await prisma.outbox.update({
@@ -70,6 +75,7 @@ export async function startOutboxPublisher() {
               lastError: message,
             },
           });
+          outboxPublishErrorsTotal.inc();
           logger.error("Outbox publish failed", { outboxId: row.id, error: message });
         }
       }
@@ -80,4 +86,10 @@ export async function startOutboxPublisher() {
 
   setInterval(() => void tick(), POLL_MS);
   logger.info("Outbox publisher started");
+}
+
+export async function stopOutboxPublisher() {
+  if (interval) clearInterval(interval);
+  await producer.disconnect();
+  logger.info("Outbox publisher stopped");
 }

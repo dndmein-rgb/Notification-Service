@@ -19,6 +19,7 @@ export const corsMiddleware = cors({
     "Authorization",
     "X-API-Key",
     "X-Requested-With",
+    "Idempotency-Key",
   ],
   exposedHeaders: ["Retry-After", "RateLimit-Limit", "RateLimit-Remaining"],
   optionsSuccessStatus: 204,

@@ -14,6 +14,7 @@ export type CreateNotificationWriteData = {
   data?: Prisma.InputJsonValue;
   status?: NotificationStatus;
   channels: DeliveryChannel[];
+  idempotencyKey?:string|null
 };
 export type CreateDeliveryWriteData = {
   notificationId: string;

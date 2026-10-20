@@ -11,6 +11,12 @@ import {
 import type { ChannelAdapter } from "../adapters/channel-adapter.interface.js";
 import { logger } from "../config/logger.js";
 import { calculateBackoffMs } from "@notification/shared-utils";
+import {
+  deliveriesDeadTotal,
+  deliveriesFailedTotal,
+  deliveriesSentTotal,
+  sendLatencySeconds,
+} from "../infrastructure/metrics.js";
 
 export function createDeliveryProcessor(
   adapters: Map<DeliveryChannel, ChannelAdapter>,
@@ -69,12 +75,13 @@ export function createDeliveryProcessor(
         `No adapter for channel ${delivery.channel}`,
         currentAttempts,
         maxAttempts,
-        {notificationId:delivery.notificationId,channel:delivery.channel}
+        { notificationId: delivery.notificationId, channel: delivery.channel },
       );
       await rollUpNotificationStatus(delivery.notificationId);
       return;
     }
 
+    const end = sendLatencySeconds.startTimer({ channel: delivery.channel });
     try {
       const result = await adapter.send({
         notificationId: delivery.notificationId,
@@ -83,6 +90,7 @@ export function createDeliveryProcessor(
         body: delivery.notification.body,
         data: delivery.notification.data ?? undefined,
       });
+      end();
 
       await prisma.$transaction(async (tx) => {
         await tx.delivery.update({
@@ -94,7 +102,7 @@ export function createDeliveryProcessor(
             lastError: null,
           },
         });
-      
+
         await tx.outbox.create({
           data: {
             eventId: crypto.randomUUID(),
@@ -111,6 +119,7 @@ export function createDeliveryProcessor(
           },
         });
       });
+      deliveriesSentTotal.inc({ channel: delivery.channel });
 
       logger.info("Delivery sent", {
         deliveryId,
@@ -118,13 +127,18 @@ export function createDeliveryProcessor(
         providerMessageId: result.providerMessageId,
       });
     } catch (err) {
+      end();
       const message = err instanceof Error ? err.message : String(err);
+      deliveriesFailedTotal.inc({ channel: delivery.channel });
       logger.error("Delivery send failed", {
         deliveryId,
         channel: delivery.channel,
         error: message,
       });
-      await handleFailure(deliveryId, message, currentAttempts, maxAttempts,{notificationId:delivery.notificationId,channel:delivery.channel});
+      await handleFailure(deliveryId, message, currentAttempts, maxAttempts, {
+        notificationId: delivery.notificationId,
+        channel: delivery.channel,
+      });
     }
 
     await rollUpNotificationStatus(delivery.notificationId);
@@ -140,19 +154,19 @@ async function handleFailure(
   attempts: number,
   maxAttempts: number,
   meta: {
-      notificationId: string;
-      channel: DeliveryChannel;
-    },
+    notificationId: string;
+    channel: DeliveryChannel;
+  },
 ) {
   if (attempts < maxAttempts) {
     const delayMs = calculateBackoffMs(attempts);
     // Mark FAILED (visible), then QUEUED so the delayed job can CAS
-    
+
     await prisma.$transaction(async (tx) => {
-     await tx.delivery.update({
+      await tx.delivery.update({
         where: { id: deliveryId },
-        data:{status:"FAILED",lastError}
-      })
+        data: { status: "FAILED", lastError },
+      });
       await tx.outbox.create({
         data: {
           eventId: crypto.randomUUID(),
@@ -166,11 +180,11 @@ async function handleFailure(
             lastError,
             attempts,
             maxAttempts,
-            willRetry:true
-          }
-        }
-      })
-    })
+            willRetry: true,
+          },
+        },
+      });
+    });
     await prisma.delivery.update({
       where: { id: deliveryId },
       data: { status: "QUEUED" },
@@ -186,8 +200,8 @@ async function handleFailure(
     await prisma.$transaction(async (tx) => {
       await tx.delivery.update({
         where: { id: deliveryId },
-        data: { status: "DEAD",lastError }
-      })
+        data: { status: "DEAD", lastError },
+      });
       await tx.outbox.create({
         data: {
           eventId: crypto.randomUUID(),
@@ -196,15 +210,16 @@ async function handleFailure(
           aggregateId: deliveryId,
           payload: {
             deliveryId,
-                        notificationId: meta.notificationId,
-                        channel: meta.channel,
-                        lastError,
-                        attempts,
-                        maxAttempts,
-          }
-        }
-      })
-    })
+            notificationId: meta.notificationId,
+            channel: meta.channel,
+            lastError,
+            attempts,
+            maxAttempts,
+          },
+        },
+      });
+    });
+    deliveriesDeadTotal.inc({ channel: meta.channel });
 
     logger.warn("Delivery moved to DEAD", {
       deliveryId,

@@ -4,6 +4,7 @@ export interface AdminInterface {
   listDeliveries(params: {
     status?: DeliveryStatus,
     channel?: string;
+    tenantId?:string
     page: number;
     limit: number
   }): Promise<{ data: Delivery[], total: number }>

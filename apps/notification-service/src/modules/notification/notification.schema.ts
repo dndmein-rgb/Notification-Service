@@ -1,15 +1,20 @@
-import { z } from "zod"
+import { z } from "zod";
+
+const ChannelSchema = z.enum(["IN_APP", "EMAIL", "SMS", "PUSH"]);
 
 export const CreateNotificationBodySchema = z.object({
-  userId: z.string().min(1,"UserId is required"),
+  userId: z.string().min(1, "UserId is required"),
   tenantId: z.string().optional(),
   type: z.string().min(1).max(200),
   title: z.string().min(1).max(100),
   body: z.string().min(1),
   data: z.record(z.string(), z.json()).optional(),
-})
+  channels: z.array(ChannelSchema).min(1).max(4).optional(),
+});
 
-export type CreateNotificationInput=z.infer<typeof CreateNotificationBodySchema>
+export type CreateNotificationInput = z.infer<
+  typeof CreateNotificationBodySchema
+>;
 
 export const GetUserNotificationsQuerySchema = z.object({
   userId: z.string().min(1, "userId is required"),
@@ -22,4 +27,18 @@ export const GetUserNotificationsQuerySchema = z.object({
     .transform((v) => v === "true"),
 });
 
-export type GetUserNotificationsQuery = z.infer<typeof GetUserNotificationsQuerySchema>;
+export type GetUserNotificationsQuery = z.infer<
+  typeof GetUserNotificationsQuerySchema
+>;
+
+export const BatchCreateNotificationBodySchema = z.object({
+  notifications: z.array(CreateNotificationBodySchema).min(1).max(100),
+});
+
+export type BatchCreateNotificationInput = z.infer<
+  typeof BatchCreateNotificationBodySchema
+>;
+
+export const NotificationIdParamsSchema = z.object({
+  id: z.uuid("Invalid notification id"),
+});

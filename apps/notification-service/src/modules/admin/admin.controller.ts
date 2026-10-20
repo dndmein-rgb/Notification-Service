@@ -10,6 +10,7 @@ export const listDeliveries = asyncHandler(async (req: Request, res: Response) =
     channel: query.channel,
     page: query.page,
     limit: query.limit,
+    tenantId:query.tenantId
   });
 
   res.status(200).json({

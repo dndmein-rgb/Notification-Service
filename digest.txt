@@ -3,10 +3,12 @@ Directory structure:
     ├── docker-compose.yml
     ├── package.json
     ├── tsconfig.base.json
+    ├── .env.example
     ├── apps/
     │   ├── notification-service/
     │   │   ├── package.json
     │   │   ├── tsconfig.json
+    │   │   ├── .env.example
     │   │   └── src/
     │   │       ├── app.ts
     │   │       ├── server.ts
@@ -14,12 +16,16 @@ Directory structure:
     │   │       │   ├── index.ts
     │   │       │   └── logger.ts
     │   │       ├── infrastructure/
+    │   │       │   ├── metrics.ts
     │   │       │   ├── prisma.ts
-    │   │       │   └── queue.ts
+    │   │       │   ├── queue.ts
+    │   │       │   └── ready.ts
     │   │       ├── middlewares/
     │   │       │   ├── admin-auth.middleware.ts
     │   │       │   ├── cors.middleware.ts
     │   │       │   ├── error.middleware.ts
+    │   │       │   ├── metrics.middleware.ts
+    │   │       │   ├── rate-limit.middleware.ts
     │   │       │   ├── req.middleware.ts
     │   │       │   └── validate.middleware.ts
     │   │       └── modules/
@@ -55,19 +61,25 @@ Directory structure:
     │   └── notification-worker/
     │       ├── package.json
     │       ├── tsconfig.json
+    │       ├── .env.example
     │       └── src/
     │           ├── index.ts
     │           ├── adapters/
     │           │   ├── channel-adapter.interface.ts
     │           │   ├── email.adapter.ts
-    │           │   └── in-app.adapter.ts
+    │           │   ├── in-app.adapter.ts
+    │           │   ├── push.adapter.ts
+    │           │   └── sms.adapter.ts
     │           ├── config/
     │           │   ├── index.ts
     │           │   └── logger.ts
     │           ├── infrastructure/
+    │           │   ├── http-ops.ts
+    │           │   ├── metrics.ts
     │           │   ├── outbox-publisher.ts
     │           │   ├── prisma.ts
-    │           │   └── queue.ts
+    │           │   ├── queue.ts
+    │           │   └── ready.ts
     │           └── processors/
     │               └── delivery.processor.ts
     └── packages/
@@ -75,6 +87,7 @@ Directory structure:
         │   ├── package.json
         │   ├── prisma.config.ts
         │   ├── tsconfig.json
+        │   ├── .env.example
         │   ├── prisma/
         │   │   └── schema.prisma
         │   └── src/
@@ -232,6 +245,31 @@ FILE: tsconfig.base.json
 
 
 ================================================
+FILE: .env.example
+================================================
+# Server
+NODE_ENV=development
+PORT=3000
+LOG_LEVEL=info
+
+# Database
+DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
+
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# Kafka
+KAFKA_BROKERS=localhost:9092
+
+# Admin
+ADMIN_API_KEY=dev-admin-key-change-me
+
+# Mailhog (later)
+SMTP_HOST=localhost
+SMTP_PORT=1025
+
+
+================================================
 FILE: apps/notification-service/package.json
 ================================================
 {
@@ -251,10 +289,14 @@ FILE: apps/notification-service/package.json
     "@prisma/client": "^7.10.0",
     "cors": "^2.8.6",
     "express": "^4.21.0",
+    "express-rate-limit": "^8.7.1",
+    "ioredis": "^5.11.1",
     "nodemailer": "^10.1.2",
     "pg": "^8.23.0",
     "pino": "^9.4.0",
     "pino-http": "^10.3.0",
+    "prom-client": "^15.1.3",
+    "rate-limit-redis": "^6.0.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {
@@ -286,6 +328,35 @@ FILE: apps/notification-service/tsconfig.json
 
 
 ================================================
+FILE: apps/notification-service/.env.example
+================================================
+# Server
+NODE_ENV=development
+PORT=3000
+LOG_LEVEL=info
+
+# Database
+DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
+
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# Kafka
+KAFKA_BROKERS=localhost:9092
+
+# Admin
+ADMIN_API_KEY=dev-admin-key-change-me
+
+# Mailhog (later)
+EMAIL_ENABLED=true
+SMTP_FROM=noreply@notification.local
+SMTP_HOST=localhost
+SMTP_PORT=1025
+
+CLIENT_ORIGINS=http://localhost:5173
+
+
+================================================
 FILE: apps/notification-service/src/app.ts
 ================================================
 import express from "express";
@@ -293,23 +364,23 @@ import express from "express";
 import { requestLogger } from "./middlewares/req.middleware.js";
 import { corsMiddleware } from "./middlewares/cors.middleware.js";
 import { errorMiddleware } from "./middlewares/error.middleware.js";
+import { metricsMiddleware } from "./middlewares/metrics.middleware.js";
 
-import adminRoutes from "./modules/admin/admin.route.js"
-import notificationRoutes from "./modules/notification/notification.route.js"
-import preferenceRoutes from "./modules/preference/preference.route.js"
+import adminRoutes from "./modules/admin/admin.route.js";
+import notificationRoutes from "./modules/notification/notification.route.js";
+import preferenceRoutes from "./modules/preference/preference.route.js";
+
+import { getReadyStatus } from "./infrastructure/ready.js";
+import { metricsText } from "./infrastructure/metrics.js";
 
 export function createApp() {
   const app = express();
 
-  app.use(corsMiddleware)
+  app.use(corsMiddleware);
   app.use(express.json());
-  app.use(requestLogger)
+  app.use(requestLogger);
+  app.use(metricsMiddleware);
 
-  
-  app.use("/admin", adminRoutes);
-  app.use("/notifications",notificationRoutes)
-  app.use("/users/:userId/preferences", preferenceRoutes);
-  
   app.get("/health", (_req, res) => {
     res.status(200).json({
       status: "ok",
@@ -317,7 +388,31 @@ export function createApp() {
       timestamp: new Date().toISOString(),
     });
   });
-  app.use(errorMiddleware)
+
+  /**
+   * Liveness-style deep check.
+   * 200 if Postgres + Redis OK; 503 otherwise.
+   */
+  app.get("/ready", async (_req, res) => {
+    const result = await getReadyStatus({ includeKafka: false });
+    res.status(result.ready ? 200 : 503).json({
+      status: result.ready ? "ready" : "not_ready",
+      service: "notification-service",
+      checks: result.checks,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.get("/metrics", async (_req, res) => {
+    res.set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    res.status(200).send(await metricsText());
+  });
+
+  app.use("/admin", adminRoutes);
+  app.use("/notifications", notificationRoutes);
+  app.use("/users/:userId/preferences", preferenceRoutes);
+
+  app.use(errorMiddleware);
   return app;
 }
 
@@ -328,13 +423,35 @@ FILE: apps/notification-service/src/server.ts
 import { createApp } from "./app.js";
 import { config } from "./config/index.js";
 import { logger } from "./config/logger.js";
+import { prisma } from "./infrastructure/prisma.js";
+import { deliveryQueue } from "./infrastructure/queue.js";
 
 async function main() {
   const app = createApp();
 
-  app.listen(config.PORT, () => {
-    logger.info(`ðŸš€ notification-service listening on port ${config.PORT}`);
+  const server = app.listen(config.PORT, () => {
+    logger.info(`notification-service listening on port ${config.PORT}`);
   });
+
+  const shutdown = async (signal: string) => {
+    logger.info(`Shutting down API (${signal})`);
+    server.close(async () => {
+      try {
+        await deliveryQueue.close();
+        await prisma.$disconnect();
+        logger.info("API shutdown complete");
+        process.exit(0);
+      } catch (err) {
+        logger.error(err, "Error during API shutdown");
+        process.exit(1);
+      }
+    });
+    // Force exit if drain takes too long
+    setTimeout(() => process.exit(1), 15_000).unref();
+  };
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 main().catch((err) => {
@@ -473,6 +590,53 @@ export const logger = {
 
 
 ================================================
+FILE: apps/notification-service/src/infrastructure/metrics.ts
+================================================
+import client  from "prom-client"
+const register = new client.Registry();
+
+client.collectDefaultMetrics({
+  register,
+  prefix:"notification_service_"
+})
+
+export const notificationsCreatedTotal = new client.Counter({
+  name: "notifications_created_total",
+  help: "Total notifications created (excludes pure idempotent replays)",
+  labelNames: ["tenant_id"] as const,
+  registers: [register],
+})
+
+export const deliveriesSentTotal = new client.Counter({
+  name: "delivery_sent_total",
+  help: "Deliveries marked SENT (incremented when API observes admin/stats paths optional; primary in worker)",
+  labelNames: ["channel"] as const,
+  registers: [register],
+});
+
+export const deliveriesDeadTotal = new client.Counter({
+  name: "delivery_dead_total",
+  help: "Deliveries moved to DEAD",
+  labelNames: ["channel"] as const,
+  registers: [register],
+});
+
+export const httpRequestDuration = new client.Histogram({
+  name: "http_request_duration_seconds",
+    help: "HTTP request duration in seconds",
+    labelNames: ["method", "route", "status_code"] as const,
+    buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+    registers: [register],
+})
+
+export async function metricsText(): Promise<string> {
+  return register.metrics();
+}
+
+export { register };
+
+
+================================================
 FILE: apps/notification-service/src/infrastructure/prisma.ts
 ================================================
 import pg from "pg"
@@ -556,6 +720,141 @@ export async function enqueueDelivery(
 
 
 ================================================
+FILE: apps/notification-service/src/infrastructure/ready.ts
+================================================
+import pg from "pg";
+import IORedis from "ioredis";
+import { config } from "../config/index.js";
+import { logger } from "../config/logger.js";
+
+export type ReadyCheck = {
+  name: string;
+  ok: boolean;
+  latencyMs?: number;
+  error?: string;
+};
+
+export type ReadyResult = {
+  ready: boolean;
+  checks: ReadyCheck[];
+};
+
+async function checkPostgres(): Promise<ReadyCheck> {
+  const start = Date.now();
+  const pool = new pg.Pool({
+    connectionString: config.DATABASE_URL,
+    max: 1,
+    connectionTimeoutMillis: 2_000,
+  });
+  try {
+    await pool.query("SELECT 1");
+    return { name: "postgres", ok: true, latencyMs: Date.now() - start };
+  } catch (err) {
+    return {
+      name: "postgres",
+      ok: false,
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    await pool.end().catch(() => undefined);
+  }
+}
+
+async function checkRedis(): Promise<ReadyCheck> {
+  const start = Date.now();
+  const redis = new IORedis(config.REDIS_URL, {
+    maxRetriesPerRequest: 1,
+    connectTimeout: 2_000,
+    lazyConnect: true,
+  });
+  try {
+    await redis.connect();
+    const pong = await redis.ping();
+    return {
+      name: "redis",
+      ok: pong === "PONG",
+      latencyMs: Date.now() - start,
+    };
+  } catch (err) {
+    return {
+      name: "redis",
+      ok: false,
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    redis.disconnect();
+  }
+}
+
+/**
+ * Optional Kafka check via TCP-ish approach: try listing metadata with kafkajs.
+ * Keep optional so API can stay up if only Kafka is used by the worker.
+ */
+async function checkKafka(): Promise<ReadyCheck | null> {
+  if (!config.KAFKA_BROKERS) return null;
+  // Lazy import so service package.json doesn't require kafkajs unless you add it
+  try {
+    const { Kafka } = await import("kafkajs");
+    const start = Date.now();
+    const kafka = new Kafka({
+      clientId: "notification-service-ready",
+      brokers: config.KAFKA_BROKERS.split(",").map((b) => b.trim()),
+      connectionTimeout: 2_000,
+      requestTimeout: 2_000,
+    });
+    const admin = kafka.admin();
+    try {
+      await admin.connect();
+      await admin.describeCluster();
+      return { name: "kafka", ok: true, latencyMs: Date.now() - start };
+    } catch (err) {
+      return {
+        name: "kafka",
+        ok: false,
+        latencyMs: Date.now() - start,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      await admin.disconnect().catch(() => undefined);
+    }
+  } catch (err) {
+    logger.debug("Kafka readiness skipped or failed to load kafkajs", { err });
+    return {
+      name: "kafka",
+      ok: false,
+      error: "kafkajs not available in service (optional)",
+    };
+  }
+}
+
+export async function getReadyStatus(opts?: {
+  includeKafka?: boolean;
+}): Promise<ReadyResult> {
+  const checks: ReadyCheck[] = [];
+
+  const [pgCheck, redisCheck] = await Promise.all([
+    checkPostgres(),
+    checkRedis(),
+  ]);
+  checks.push(pgCheck, redisCheck);
+
+  if (opts?.includeKafka) {
+    const kafkaCheck = await checkKafka();
+    if (kafkaCheck) checks.push(kafkaCheck);
+  }
+
+  // Required: postgres + redis. Kafka optional for API readiness.
+  const requiredOk = checks
+    .filter((c) => c.name === "postgres" || c.name === "redis")
+    .every((c) => c.ok);
+
+  return { ready: requiredOk, checks };
+}
+
+
+================================================
 FILE: apps/notification-service/src/middlewares/admin-auth.middleware.ts
 ================================================
 import type { Request, Response, NextFunction } from "express";
@@ -601,6 +900,7 @@ export const corsMiddleware = cors({
     "Authorization",
     "X-API-Key",
     "X-Requested-With",
+    "Idempotency-Key",
   ],
   exposedHeaders: ["Retry-After", "RateLimit-Limit", "RateLimit-Remaining"],
   optionsSuccessStatus: 204,
@@ -634,6 +934,24 @@ export function errorMiddleware(
     return;
   }
 
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code: string }).code;
+    if (code === "P2025") {
+      res.status(404).json({
+        success: false,
+        error: { code: "NOT_FOUND", message: "Resource not found" },
+      });
+      return;
+    }
+    if (code === "P2002") {
+      res.status(409).json({
+        success: false,
+        error: { code: "CONFLICT", message: "Unique constraint violation" },
+      });
+      return;
+    }
+  }
+
   logger.error({ err }, "Unhandled error");
   res.status(500).json({
     success: false,
@@ -646,6 +964,115 @@ export function errorMiddleware(
     },
   });
 }
+
+
+================================================
+FILE: apps/notification-service/src/middlewares/metrics.middleware.ts
+================================================
+import type { RequestHandler } from "express";
+import { httpRequestDuration } from "../infrastructure/metrics.js";
+
+export const metricsMiddleware: RequestHandler = (req, res, next) => {
+  const end = httpRequestDuration.startTimer();
+  res.on("finish", () => {
+    const route = req.route?.path
+      ? `${req.baseUrl}${req.route.path}`
+      : req.path;
+    end({
+      method: req.method,
+      route,
+      status_code: String(res.statusCode),
+    });
+  });
+  next();
+};
+
+
+================================================
+FILE: apps/notification-service/src/middlewares/rate-limit.middleware.ts
+================================================
+import IORedis from "ioredis";
+import { config } from "../config";
+import rateLimit, {
+  ValueDeterminingMiddleware,
+  Options,
+} from "express-rate-limit";
+import RedisStore, { RedisReply } from "rate-limit-redis";
+import { RequestHandler } from "express";
+const rateLimitRedis = new IORedis(config.REDIS_URL, {
+  maxRetriesPerRequest: null,
+});
+
+interface RateLimiterOptions {
+  windowMs: number;
+  limit: number;
+  prefix: string;
+  error: { message: string; code: string };
+  keyGenerator?: Options["keyGenerator"];
+}
+
+export const createRateLimiter = ({
+  windowMs,
+  limit,
+  prefix,
+  error,
+  keyGenerator,
+}: RateLimiterOptions): RequestHandler => {
+  const options: Partial<Options> = {
+    windowMs,
+    limit,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    // Fail open if Redis is unavailable.
+    passOnStoreError: true,
+    validate: {
+      keyGeneratorIpFallback: false,
+    },
+    store: new RedisStore({
+      sendCommand: async (...args: string[]) => {
+        const [command, ...commandArgs] = args;
+        if (!command) {
+          throw new Error("Redis command is required");
+        }
+        return rateLimitRedis.call(
+          command,
+          ...commandArgs,
+        ) as Promise<RedisReply>;
+      },
+      prefix: `rate-limit:${prefix}:`,
+    }),
+
+    ...(keyGenerator ? { keyGenerator } : {}),
+
+    handler: (_req, res) => {
+      res.status(429).json({
+        success: false,
+        error: {
+          code: error.code,
+          message: error.message,
+        },
+      });
+    },
+  };
+
+  return rateLimit(options);
+};
+
+export const createNotificationLimiter = createRateLimiter({
+  windowMs: 60_000,
+  limit: 60,
+  error: {
+    code: "RATE_LIMITED",
+    message: "Too many notification create requests, try again later",
+  },
+  prefix: "notification-create",
+  keyGenerator: (req) => {
+      const apiKey = req.header("X-API-Key") ?? req.header("x-api-key");
+      if (apiKey) return `key:${apiKey}`;
+      return `ip:${req.ip ?? "unknown"}`;
+    },
+});
+
 
 
 ================================================
@@ -734,6 +1161,7 @@ export const listDeliveries = asyncHandler(async (req: Request, res: Response) =
     channel: query.channel,
     page: query.page,
     limit: query.limit,
+    tenantId:query.tenantId
   });
 
   res.status(200).json({
@@ -769,6 +1197,7 @@ export interface AdminInterface {
   listDeliveries(params: {
     status?: DeliveryStatus,
     channel?: string;
+    tenantId?:string
     page: number;
     limit: number
   }): Promise<{ data: Delivery[], total: number }>
@@ -792,13 +1221,17 @@ export class AdminRepository implements AdminInterface {
   async listDeliveries(params: {
     status?: DeliveryStatus;
     channel?: string;
+    tenantId?: string;
     page: number;
     limit: number;
   }): Promise<{ data: Delivery[]; total: number }> {
-    const { limit, status, channel, page } = params;
+    const { limit, status, channel, page ,tenantId} = params;
     const where: Record<string, unknown> = {};
     if (status) where.status = status;
-    if (channel) where.status = channel;
+    if (channel) where.channel = channel;
+    if (tenantId) {
+        where.notification = { tenantId };
+      }
     const [data, total] = await Promise.all([
       prisma.delivery.findMany({
         where,
@@ -813,6 +1246,7 @@ export class AdminRepository implements AdminInterface {
               title: true,
               type: true,
               status: true,
+              tenantId:true
             },
           },
         },
@@ -922,12 +1356,13 @@ export const ListDeliveriesQuerySchema = z.object({
       .default("DEAD"),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(20).default(20),
-    channel: z.enum(["IN_APP", "EMAIL", "SMS", "PUSH"]).optional(),
+  channel: z.enum(["IN_APP", "EMAIL", "SMS", "PUSH"]).optional(),
+    tenantId: z.string().min(1).optional(),
 })
 export type ListDeliveriesQuery = z.infer<typeof ListDeliveriesQuerySchema>;
 
 export const DeliveryIdParamsSchema = z.object({
-  id: z.string().uuid("Invalid delivery id"),
+  id: z.uuid("Invalid delivery id"),
 });
 
 export type DeliveryIdParams = z.infer<typeof DeliveryIdParamsSchema>;
@@ -950,6 +1385,7 @@ export class AdminService {
     channel?: string;
     page: number;
     limit: number;
+    tenantId?:string
   }) {
     const { data, total } = await this.repo.listDeliveries(params);
     return {
@@ -1009,52 +1445,89 @@ export const notificationService = new NotificationService(
 FILE: apps/notification-service/src/modules/notification/notification.controller.ts
 ================================================
 import { asyncHandler } from "@notification/shared-utils";
-import type{Request,Response} from 'express'
-import { CreateNotificationInput, GetUserNotificationsQuery } from "./notification.schema";
-import { notificationService } from "./notification.container";
+import type { Request, Response } from "express";
+import type {
+  CreateNotificationInput,
+  GetUserNotificationsQuery,
+  BatchCreateNotificationInput,
+} from "./notification.schema.js";
+import { notificationService } from "./notification.container.js";
 
-export const createNotification=asyncHandler(async(req:Request,res:Response)=>{
-  const body=req.body as CreateNotificationInput;
-  const result=await notificationService.create(body)
-  res.status(201).json({
-    success:true,
-    message:"Notification created successfully",
-    data:result
-  })
-})
+export const createNotification = asyncHandler(
+  async (req: Request, res: Response) => {
+    const body = req.body as CreateNotificationInput;
+    const idempotencyKey =
+      req.header("Idempotency-Key") ?? req.header("idempotency-key") ?? null;
 
-export const userNotifications=asyncHandler(async(req:Request,res:Response)=>{
-  const {limit,page,userId,unreadOnly,tenantId}=res.locals.validatedQuery as  GetUserNotificationsQuery
-  const result=await notificationService.getUserNotifications({limit,page,userId,tenantId,unreadOnly})
-  
-  res.status(200).json({
+    const { notification, idempotentReplay } = await notificationService.create(
+      body,
+      idempotencyKey,
+    );
+
+    res.status(idempotentReplay ? 200 : 201).json({
+      success: true,
+      message: idempotentReplay
+        ? "Notification already created (idempotent replay)"
+        : "Notification created successfully",
+      data: notification,
+      meta: { idempotentReplay },
+    });
+  },
+);
+
+export const batchCreateNotifications = asyncHandler(
+  async (req: Request, res: Response) => {
+    const body = req.body as BatchCreateNotificationInput;
+    const result = await notificationService.createBatch(body);
+
+    res.status(207).json({
+      success: result.failed === 0,
+      message: "Batch processed",
+      data: result,
+    });
+  },
+);
+
+export const userNotifications = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { limit, page, userId, unreadOnly, tenantId } = res.locals
+      .validatedQuery as GetUserNotificationsQuery;
+
+    const result = await notificationService.getUserNotifications({
+      limit,
+      page,
+      userId,
+      tenantId,
+      unreadOnly,
+    });
+
+    res.status(200).json({
       success: true,
       data: result.data,
       meta: result.meta,
     });
-  });
+  },
+);
 
-export const findById=asyncHandler(async(req:Request,res:Response)=>{
-  const id=req.params.id 
-  const result=await notificationService.findNotificationById(id)
+export const findById = asyncHandler(async (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  const result = await notificationService.findNotificationById(id);
   res.status(200).json({
-    success:true,
-    message:"Notification fetched successfully",
-    data:result
-  })
-})
+    success: true,
+    message: "Notification fetched successfully",
+    data: result,
+  });
+});
 
 export const markAsRead = asyncHandler(async (req: Request, res: Response) => {
-  const id = req.params.id;
+  const id = req.params.id as string;
   const result = await notificationService.markAsRead(id);
   res.status(200).json({
     success: true,
-    message: "Notification read succesfully",
-    data:result
-  })
-})
-
-
+    message: "Notification read successfully",
+    data: result,
+  });
+});
 
 
 ================================================
@@ -1065,6 +1538,9 @@ import { CreateNotificationWriteData, NotificationWithDeliveries,UpdateDeliveryD
 
 export interface NotificationInterface{
   create(data: CreateNotificationWriteData): Promise<NotificationWithDeliveries>
+
+  findByIdempotencyKey(key:string,tenantId?:string|null):Promise<NotificationWithDeliveries|null>
+  
    findByUserId(params: {
     userId: string;
     tenantId?: string;
@@ -1109,7 +1585,7 @@ export class NotificationRepository implements NotificationInterface {
   async create(
     data: CreateNotificationWriteData,
   ): Promise<NotificationWithDeliveries> {
-    const { channels, status, ...notificationData } = data;
+    const { channels, status, idempotencyKey,...notificationData } = data;
     return prisma.$transaction(async (tx) => {
       const notification = await tx.notification.create({
         data: {
@@ -1144,11 +1620,37 @@ export class NotificationRepository implements NotificationInterface {
           },
         },
       });
+      if (idempotencyKey) {
+            await tx.idempotencyKey.create({
+              data: {
+                key: idempotencyKey,
+                tenantId: notification.tenantId ?? null,
+                notificationId: notification.id,
+              },
+            });
+          }
 
       return notification;
     });
   }
 
+async findByIdempotencyKey(key: string, tenantId?: string | null): Promise<NotificationWithDeliveries | null> {
+  const row = await prisma.idempotencyKey.findFirst({
+        where: {
+          key,
+          ...(tenantId != null && tenantId !== ""
+            ? { tenantId }
+            : { tenantId: null }),
+        },
+      });
+      if (!row) return null;
+  
+      return prisma.notification.findUnique({
+        where: { id: row.notificationId },
+        include: { deliveries: true },
+      });
+}
+  
   async findByUserId(params: {
     userId: string;
     tenantId?: string;
@@ -1253,48 +1755,69 @@ export class NotificationRepository implements NotificationInterface {
 FILE: apps/notification-service/src/modules/notification/notification.route.ts
 ================================================
 import express from "express";
-import { validate } from "../../middlewares/validate.middleware";
+import { validate } from "../../middlewares/validate.middleware.js";
+import { createNotificationLimiter } from "../../middlewares/rate-limit.middleware.js";
 import {
   CreateNotificationBodySchema,
   GetUserNotificationsQuerySchema,
-} from "./notification.schema";
+  BatchCreateNotificationBodySchema,
+} from "./notification.schema.js";
 import {
   createNotification,
+  batchCreateNotifications,
   userNotifications,
   findById,
   markAsRead,
-} from "./notification.controller";
+} from "./notification.controller.js";
 
 const router = express.Router();
 
 router
   .route("/")
-  .post(validate(CreateNotificationBodySchema), createNotification);
+  .post(
+    createNotificationLimiter,
+    validate(CreateNotificationBodySchema),
+    createNotification,
+  )
+  .get(
+    validate(GetUserNotificationsQuerySchema, "query"),
+    userNotifications,
+  );
+
 router
-  .route("/")
-  .get(validate(GetUserNotificationsQuerySchema, "query"), userNotifications);
+  .route("/batch")
+  .post(
+    createNotificationLimiter,
+    validate(BatchCreateNotificationBodySchema),
+    batchCreateNotifications,
+  );
+
 router.route("/:id").get(findById);
 router.route("/:id/read").patch(markAsRead);
 
 export default router;
 
 
-
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.schema.ts
 ================================================
-import { z } from "zod"
+import { z } from "zod";
+
+const ChannelSchema = z.enum(["IN_APP", "EMAIL", "SMS", "PUSH"]);
 
 export const CreateNotificationBodySchema = z.object({
-  userId: z.string().min(1,"UserId is required"),
+  userId: z.string().min(1, "UserId is required"),
   tenantId: z.string().optional(),
   type: z.string().min(1).max(200),
   title: z.string().min(1).max(100),
   body: z.string().min(1),
   data: z.record(z.string(), z.json()).optional(),
-})
+  channels: z.array(ChannelSchema).min(1).max(4).optional(),
+});
 
-export type CreateNotificationInput=z.infer<typeof CreateNotificationBodySchema>
+export type CreateNotificationInput = z.infer<
+  typeof CreateNotificationBodySchema
+>;
 
 export const GetUserNotificationsQuerySchema = z.object({
   userId: z.string().min(1, "userId is required"),
@@ -1307,62 +1830,162 @@ export const GetUserNotificationsQuerySchema = z.object({
     .transform((v) => v === "true"),
 });
 
-export type GetUserNotificationsQuery = z.infer<typeof GetUserNotificationsQuerySchema>;
+export type GetUserNotificationsQuery = z.infer<
+  typeof GetUserNotificationsQuerySchema
+>;
+
+export const BatchCreateNotificationBodySchema = z.object({
+  notifications: z.array(CreateNotificationBodySchema).min(1).max(100),
+});
+
+export type BatchCreateNotificationInput = z.infer<
+  typeof BatchCreateNotificationBodySchema
+>;
+
+export const NotificationIdParamsSchema = z.object({
+  id: z.uuid("Invalid notification id"),
+});
+
 
 
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.service.ts
 ================================================
-import {
-  NotFoundError,
-  ValidationError,
-} from "@notification/shared-utils";
+import { NotFoundError, ValidationError } from "@notification/shared-utils";
 import type { DeliveryChannel } from "@notification/database";
 import type { NotificationInterface } from "./notification.interface.js";
-import type { CreateNotificationInput } from "./notification.schema.js";
+import type {
+  BatchCreateNotificationInput,
+  CreateNotificationInput,
+} from "./notification.schema.js";
 import { enqueueDelivery } from "../../infrastructure/queue.js";
 import { logger } from "../../config/logger.js";
 import { preferenceService } from "../preference/preference.container.js";
+import { notificationsCreatedTotal } from "../../infrastructure/metrics.js";
 
 const DEFAULT_CHANNELS: DeliveryChannel[] = ["IN_APP", "EMAIL"];
 
 export class NotificationService {
   constructor(private readonly repo: NotificationInterface) {}
 
-  async create(input: CreateNotificationInput) {
-    // 1. Resolve channels against user preferences
-        //    - missing pref = enabled (opt-out)
-        //    - IN_APP always kept
-        //    - disabled channels are skipped (no Delivery row)
-        const channels = await preferenceService.resolveChannels(
-              input.userId,
-              DEFAULT_CHANNELS,
-            );
-    const notification = await this.repo.create({
-      userId: input.userId,
-      tenantId: input.tenantId ?? null,
-      type: input.type,
-      title: input.title,
-      body: input.body,
-      data: input.data ?? undefined,
-      status: "PENDING",
-      channels,
-    });
-
-    // 2. Enqueue one job per delivery (after TX committed)
-    for (const delivery of notification.deliveries) {
-      await enqueueDelivery(delivery.id);
+  /**
+   * Create one notification.
+   * If idempotencyKey is set and already used â†’ return existing (no new jobs).
+   */
+  async create(input: CreateNotificationInput, idempotencyKey?: string | null) {
+    const tenantId = input.tenantId ?? null;
+    if (idempotencyKey) {
+      const existing = await this.repo.findByIdempotencyKey(
+        idempotencyKey,
+        tenantId,
+      );
+      if (existing) {
+        logger.info("Idempotent hit â€” returning existing notification", {
+          notificationId: existing.id,
+          idempotencyKey,
+        });
+        return { notification: existing, idempotentReplay: true };
+      }
     }
 
-    logger.info("Notification created and jobs enqueued", {
-      notificationId: notification.id,
-      deliveryIds: notification.deliveries.map((d) => d.id),
-    });
+    const requested = input.channels?.length
+      ? input.channels
+      : DEFAULT_CHANNELS;
 
-    // Status is still PENDING; worker will move it to DELIVERED / PARTIAL / FAILED
-    return notification;
+    const channels = await preferenceService.resolveChannels(
+      input.userId,
+      DEFAULT_CHANNELS,
+    );
+
+    try {
+      const notification = await this.repo.create({
+        userId: input.userId,
+        tenantId: input.tenantId ?? null,
+        type: input.type,
+        title: input.title,
+        body: input.body,
+        data: input.data ?? undefined,
+        status: "PENDING",
+        channels,
+        idempotencyKey: idempotencyKey ?? null,
+      });
+
+      // 2. Enqueue one job per delivery (after TX committed)
+      for (const delivery of notification.deliveries) {
+        await enqueueDelivery(delivery.id);
+      }
+
+      notificationsCreatedTotal.inc({
+        tenant_id: input.tenantId ?? "none",
+      });
+
+      logger.info("Notification created and jobs enqueued", {
+        notificationId: notification.id,
+        deliveryIds: notification.deliveries.map((d) => d.id),
+      });
+
+      // Status is still PENDING; worker will move it to DELIVERED / PARTIAL / FAILED
+      return { notification, idempotentReplay: false };
+    } catch (err: unknown) {
+      // Concurrent duplicate key â†’ treat as replay
+      if (
+        idempotencyKey &&
+        err &&
+        typeof err === "object" &&
+        "code" in err &&
+        (err as { code: string }).code === "P2002"
+      ) {
+        const existing = await this.repo.findByIdempotencyKey(
+          idempotencyKey,
+          tenantId,
+        );
+        if (existing) {
+          return { notification: existing, idempotentReplay: true };
+        }
+      }
+      throw err;
+    }
   }
 
+  async createBatch(
+    input: BatchCreateNotificationInput,
+    // optional single key for whole batch is unusual; per-item keys via headers not standard â€”
+    // batch items rely on normal create without shared key unless you extend later
+  ) {
+    const results: Array<{
+      index: number;
+      success: boolean;
+      data?: unknown;
+      error?: string;
+    }> = [];
+
+    for (let i = 0; i < input.notifications.length; i++) {
+      try {
+        const { notification, idempotentReplay } = await this.create(
+          input.notifications[i],
+          null,
+        );
+        results.push({
+          index: i,
+          success: true,
+          data: { ...notification, idempotentReplay },
+        });
+      } catch (err) {
+        results.push({
+          index: i,
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return {
+      total: input.notifications.length,
+      succeeded: results.filter((r) => r.success).length,
+      failed: results.filter((r) => !r.success).length,
+      results,
+    };
+  }
   async getUserNotifications(params: {
     userId: string;
     tenantId?: string;
@@ -1416,6 +2039,7 @@ export class NotificationService {
 }
 
 
+
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.types.ts
 ================================================
@@ -1435,6 +2059,7 @@ export type CreateNotificationWriteData = {
   data?: Prisma.InputJsonValue;
   status?: NotificationStatus;
   channels: DeliveryChannel[];
+  idempotencyKey?:string|null
 };
 export type CreateDeliveryWriteData = {
   notificationId: string;
@@ -1794,11 +2419,12 @@ FILE: apps/notification-worker/package.json
     "@prisma/client": "^7.10.0",
     "bullmq": "^5.x",
     "ioredis": "^5.x",
+    "kafkajs": "^2.2.4",
     "nodemailer": "^10.x",
     "pg": "^8.x",
     "pino": "^9.x",
-    "zod": "^4.x",
-    "kafkajs": "^2.2.4"
+    "prom-client": "^15.1.3",
+    "zod": "^4.x"
   }
 }
 
@@ -1819,6 +2445,21 @@ FILE: apps/notification-worker/tsconfig.json
 
 
 ================================================
+FILE: apps/notification-worker/.env.example
+================================================
+NODE_ENV=development
+LOG_LEVEL=info
+DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
+REDIS_URL=redis://localhost:6379
+EMAIL_ENABLED=true
+SMTP_HOST=localhost
+SMTP_PORT=1025
+SMTP_FROM=noreply@notification.local
+KAFKA_BROKERS=localhost:9092
+METRICS_PORT=http://localhost:3001
+
+
+================================================
 FILE: apps/notification-worker/src/index.ts
 ================================================
 import { Worker } from "bullmq";
@@ -1834,6 +2475,10 @@ import { InAppAdapter } from "./adapters/in-app.adapter.js";
 import { EmailAdapter } from "./adapters/email.adapter.js";
 import type { DeliveryChannel } from "@notification/database";
 import type { ChannelAdapter } from "./adapters/channel-adapter.interface.js";
+import { startOutboxPublisher } from "./infrastructure/outbox-publisher.js";
+import { SmsAdapter } from "./adapters/sms.adapter.js";
+import { PushAdapter } from "./adapters/push.adapter.js";
+import { startOpsServer } from "./infrastructure/http-ops.js";
 
 async function main() {
   const connection = createRedisConnection();
@@ -1841,6 +2486,8 @@ async function main() {
   const adapters = new Map<DeliveryChannel, ChannelAdapter>([
     ["IN_APP", new InAppAdapter()],
     ["EMAIL", new EmailAdapter()],
+    ["SMS", new SmsAdapter()],
+    ["PUSH",new PushAdapter()]
   ]);
 
   const processor = createDeliveryProcessor(adapters);
@@ -1865,12 +2512,14 @@ async function main() {
       error: err.message,
     });
   });
-
+  const opsServer = startOpsServer();
+await startOutboxPublisher();
   logger.info(`notification-worker started (queue=${DELIVERY_QUEUE_NAME})`);
 
   const shutdown = async (signal: string) => {
     logger.info(`Shutting down worker (${signal})`);
     await worker.close();
+    opsServer.close();
     await connection.quit();
     await prisma.$disconnect();
     process.exit(0);
@@ -1975,12 +2624,64 @@ import { logger } from "../config/logger.js";
 export class InAppAdapter implements ChannelAdapter{
   readonly channel: DeliveryChannel = "IN_APP";
   async send(payload: SendPayload): Promise<SendResult> {
-    // In-app is just a record in the DB. Nothing to push externally in Phase 2.
+    
         logger.debug("InAppAdapter: delivery recorded", {
           notificationId: payload.notificationId,
           userId: payload.userId,
         });
         return {}; // no providerMessageId
+  }
+}
+
+
+================================================
+FILE: apps/notification-worker/src/adapters/push.adapter.ts
+================================================
+import type { DeliveryChannel } from "@notification/database";
+import type {
+  ChannelAdapter,
+  SendPayload,
+  SendResult,
+} from "./channel-adapter.interface.js";
+import { logger } from "../config/logger.js";
+
+export class PushAdapter implements ChannelAdapter {
+  readonly channel: DeliveryChannel = "PUSH";
+
+  async send(payload: SendPayload): Promise<SendResult> {
+    const providerMessageId = `push-stub-${Date.now()}-${payload.notificationId.slice(0, 8)}`;
+
+    logger.info("PushAdapter: stub send", {
+      notificationId: payload.notificationId,
+      userId: payload.userId,
+      title: payload.title,
+      providerMessageId,
+    });
+
+    return { providerMessageId };
+  }
+}
+
+
+================================================
+FILE: apps/notification-worker/src/adapters/sms.adapter.ts
+================================================
+import type { DeliveryChannel } from "@notification/database";
+import { ChannelAdapter, SendPayload, SendResult } from "./channel-adapter.interface";
+import { logger } from "../config/logger";
+
+export class SmsAdapter implements ChannelAdapter{
+  readonly channel: DeliveryChannel = "SMS"
+  async send(payload: SendPayload): Promise<SendResult>{
+    const providerMessageId = `sms-stub-${Date.now()}-${payload.notificationId.slice(0, 8)}`;
+    logger.info("SmsAdapter: stub send", {
+          notificationId: payload.notificationId,
+          userId: payload.userId,
+          title: payload.title,
+          providerMessageId,
+        });
+    
+        return { providerMessageId };
   }
 }
 
@@ -1996,7 +2697,7 @@ const envSchema = z.object({
   LOG_LEVEL: z.string().default("info"),
   DATABASE_URL: z.string(),
   REDIS_URL: z.string(),
-  KAFKA_BROKER: z.string().default("localhost:9096"),
+  KAFKA_BROKERS: z.string().default("localhost:9092"),
   EMAIL_ENABLED: z
     .enum(["true", "false"])
     .default("true")
@@ -2004,6 +2705,7 @@ const envSchema = z.object({
   SMTP_HOST: z.string().default("localhost"),
   SMTP_PORT: z.coerce.number().default(1025),
   SMTP_FROM: z.string().default("noreply@notification.local"),
+  METRICS_PORT: z.coerce.number().default(3001),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -2107,6 +2809,116 @@ export const logger = {
 
 
 ================================================
+FILE: apps/notification-worker/src/infrastructure/http-ops.ts
+================================================
+import http from "node:http";
+import { metricsText } from "./metrics.js";
+import { getReadyStatus } from "./ready.js";
+import { logger } from "../config/logger.js";
+import { config } from "../config/index.js";
+
+export function startOpsServer(): http.Server {
+  const server = http.createServer(async (req, res) => {
+    try {
+      if (req.url === "/metrics" && req.method === "GET") {
+        const body = await metricsText();
+        res.writeHead(200, {
+          "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+        });
+        res.end(body);
+        return;
+      }
+      if (req.url === "/ready" && req.method === "GET") {
+        const result = await getReadyStatus({ includeKafka: true });
+        res.writeHead(result.ready ? 200 : 503, {
+          "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify({ status: result.ready ? "ready" : "not_ready", ...result }));
+        return;
+      }
+      if (req.url === "/health" && req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", service: "notification-worker" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    } catch (err) {
+      logger.error(err, "ops server error");
+      res.writeHead(500);
+      res.end();
+    }
+  });
+
+  server.listen(config.METRICS_PORT, () => {
+    logger.info(`Worker ops server on :${config.METRICS_PORT} (/metrics /ready)`);
+  });
+
+  return server;
+}
+
+
+================================================
+FILE: apps/notification-worker/src/infrastructure/metrics.ts
+================================================
+import client from "prom-client";
+
+const register = new client.Registry();
+
+client.collectDefaultMetrics({
+  register,
+  prefix: "notification_worker_",
+});
+
+export const deliveriesSentTotal = new client.Counter({
+  name: "delivery_sent_total",
+  help: "Deliveries successfully sent",
+  labelNames: ["channel"] as const,
+  registers: [register],
+});
+
+export const deliveriesDeadTotal = new client.Counter({
+  name: "delivery_dead_total",
+  help: "Deliveries moved to DEAD",
+  labelNames: ["channel"] as const,
+  registers: [register],
+});
+
+export const deliveriesFailedTotal = new client.Counter({
+  name: "delivery_failed_total",
+  help: "Delivery send failures (includes retries)",
+  labelNames: ["channel"] as const,
+  registers: [register],
+});
+
+export const sendLatencySeconds = new client.Histogram({
+  name: "delivery_send_latency_seconds",
+  help: "Time spent in channel adapter send()",
+  labelNames: ["channel"] as const,
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [register],
+});
+
+export const outboxPublishedTotal = new client.Counter({
+  name: "outbox_published_total",
+  help: "Outbox rows successfully published to Kafka",
+  registers: [register],
+});
+
+export const outboxPublishErrorsTotal = new client.Counter({
+  name: "outbox_publish_errors_total",
+  help: "Outbox publish failures",
+  registers: [register],
+});
+
+export async function metricsText(): Promise<string> {
+  return register.metrics();
+}
+
+export { register };
+
+
+================================================
 FILE: apps/notification-worker/src/infrastructure/outbox-publisher.ts
 ================================================
 // infrastructure/outbox-publisher.ts (conceptual)
@@ -2114,6 +2926,7 @@ import { Kafka } from "kafkajs";
 import { prisma } from "./prisma.js";
 import { config } from "../config/index.js";
 import { logger } from "../config/logger.js";
+import { outboxPublishedTotal, outboxPublishErrorsTotal } from "./metrics.js";
 
 const TOPIC = "notification.events";
 const BATCH_SIZE = 50;
@@ -2121,8 +2934,10 @@ const POLL_MS = 1000;
 
 const kafka = new Kafka({
   clientId: "notification-outbox-publisher",
-  brokers: [config.KAFKA_BROKER],
+  brokers: [config.KAFKA_BROKERS],
 });
+
+let interval: ReturnType<typeof setInterval> | null = null;
 
 const producer = kafka.producer({ idempotent: true });
 
@@ -2172,6 +2987,7 @@ export async function startOutboxPublisher() {
               lastError: null,
             },
           });
+          outboxPublishedTotal.inc();
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           await prisma.outbox.update({
@@ -2181,6 +2997,7 @@ export async function startOutboxPublisher() {
               lastError: message,
             },
           });
+          outboxPublishErrorsTotal.inc();
           logger.error("Outbox publish failed", { outboxId: row.id, error: message });
         }
       }
@@ -2191,6 +3008,12 @@ export async function startOutboxPublisher() {
 
   setInterval(() => void tick(), POLL_MS);
   logger.info("Outbox publisher started");
+}
+
+export async function stopOutboxPublisher() {
+  if (interval) clearInterval(interval);
+  await producer.disconnect();
+  logger.info("Outbox publisher stopped");
 }
 
 
@@ -2277,6 +3100,141 @@ export async function enqueueDelivery(deliveryId: string, delayMs = 0, attempt =
 
 
 ================================================
+FILE: apps/notification-worker/src/infrastructure/ready.ts
+================================================
+import pg from "pg";
+import IORedis from "ioredis";
+import { config } from "../config/index.js";
+import { logger } from "../config/logger.js";
+
+export type ReadyCheck = {
+  name: string;
+  ok: boolean;
+  latencyMs?: number;
+  error?: string;
+};
+
+export type ReadyResult = {
+  ready: boolean;
+  checks: ReadyCheck[];
+};
+
+async function checkPostgres(): Promise<ReadyCheck> {
+  const start = Date.now();
+  const pool = new pg.Pool({
+    connectionString: config.DATABASE_URL,
+    max: 1,
+    connectionTimeoutMillis: 2_000,
+  });
+  try {
+    await pool.query("SELECT 1");
+    return { name: "postgres", ok: true, latencyMs: Date.now() - start };
+  } catch (err) {
+    return {
+      name: "postgres",
+      ok: false,
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    await pool.end().catch(() => undefined);
+  }
+}
+
+async function checkRedis(): Promise<ReadyCheck> {
+  const start = Date.now();
+  const redis = new IORedis(config.REDIS_URL, {
+    maxRetriesPerRequest: 1,
+    connectTimeout: 2_000,
+    lazyConnect: true,
+  });
+  try {
+    await redis.connect();
+    const pong = await redis.ping();
+    return {
+      name: "redis",
+      ok: pong === "PONG",
+      latencyMs: Date.now() - start,
+    };
+  } catch (err) {
+    return {
+      name: "redis",
+      ok: false,
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    redis.disconnect();
+  }
+}
+
+/**
+ * Optional Kafka check via TCP-ish approach: try listing metadata with kafkajs.
+ * Keep optional so API can stay up if only Kafka is used by the worker.
+ */
+async function checkKafka(): Promise<ReadyCheck | null> {
+  if (!config.KAFKA_BROKERS) return null;
+  // Lazy import so service package.json doesn't require kafkajs unless you add it
+  try {
+    const { Kafka } = await import("kafkajs");
+    const start = Date.now();
+    const kafka = new Kafka({
+      clientId: "notification-service-ready",
+      brokers: config.KAFKA_BROKERS.split(",").map((b) => b.trim()),
+      connectionTimeout: 2_000,
+      requestTimeout: 2_000,
+    });
+    const admin = kafka.admin();
+    try {
+      await admin.connect();
+      await admin.describeCluster();
+      return { name: "kafka", ok: true, latencyMs: Date.now() - start };
+    } catch (err) {
+      return {
+        name: "kafka",
+        ok: false,
+        latencyMs: Date.now() - start,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      await admin.disconnect().catch(() => undefined);
+    }
+  } catch (err) {
+    logger.debug("Kafka readiness skipped or failed to load kafkajs", { err });
+    return {
+      name: "kafka",
+      ok: false,
+      error: "kafkajs not available in service (optional)",
+    };
+  }
+}
+
+export async function getReadyStatus(opts?: {
+  includeKafka?: boolean;
+}): Promise<ReadyResult> {
+  const checks: ReadyCheck[] = [];
+
+  const [pgCheck, redisCheck] = await Promise.all([
+    checkPostgres(),
+    checkRedis(),
+  ]);
+  checks.push(pgCheck, redisCheck);
+
+  if (opts?.includeKafka) {
+    const kafkaCheck = await checkKafka();
+    if (kafkaCheck) checks.push(kafkaCheck);
+  }
+
+  // Required: postgres + redis. Kafka optional for API readiness.
+  const requiredOk = checks
+    .filter((c) => c.name === "postgres" || c.name === "redis")
+    .every((c) => c.ok);
+
+  return { ready: requiredOk, checks };
+}
+
+
+================================================
 FILE: apps/notification-worker/src/processors/delivery.processor.ts
 ================================================
 import type { Job } from "bullmq";
@@ -2292,6 +3250,12 @@ import {
 import type { ChannelAdapter } from "../adapters/channel-adapter.interface.js";
 import { logger } from "../config/logger.js";
 import { calculateBackoffMs } from "@notification/shared-utils";
+import {
+  deliveriesDeadTotal,
+  deliveriesFailedTotal,
+  deliveriesSentTotal,
+  sendLatencySeconds,
+} from "../infrastructure/metrics.js";
 
 export function createDeliveryProcessor(
   adapters: Map<DeliveryChannel, ChannelAdapter>,
@@ -2350,11 +3314,13 @@ export function createDeliveryProcessor(
         `No adapter for channel ${delivery.channel}`,
         currentAttempts,
         maxAttempts,
+        { notificationId: delivery.notificationId, channel: delivery.channel },
       );
       await rollUpNotificationStatus(delivery.notificationId);
       return;
     }
 
+    const end = sendLatencySeconds.startTimer({ channel: delivery.channel });
     try {
       const result = await adapter.send({
         notificationId: delivery.notificationId,
@@ -2363,6 +3329,7 @@ export function createDeliveryProcessor(
         body: delivery.notification.body,
         data: delivery.notification.data ?? undefined,
       });
+      end();
 
       await prisma.$transaction(async (tx) => {
         await tx.delivery.update({
@@ -2374,7 +3341,7 @@ export function createDeliveryProcessor(
             lastError: null,
           },
         });
-      
+
         await tx.outbox.create({
           data: {
             eventId: crypto.randomUUID(),
@@ -2391,6 +3358,7 @@ export function createDeliveryProcessor(
           },
         });
       });
+      deliveriesSentTotal.inc({ channel: delivery.channel });
 
       logger.info("Delivery sent", {
         deliveryId,
@@ -2398,13 +3366,18 @@ export function createDeliveryProcessor(
         providerMessageId: result.providerMessageId,
       });
     } catch (err) {
+      end();
       const message = err instanceof Error ? err.message : String(err);
+      deliveriesFailedTotal.inc({ channel: delivery.channel });
       logger.error("Delivery send failed", {
         deliveryId,
         channel: delivery.channel,
         error: message,
       });
-      await handleFailure(deliveryId, message, currentAttempts, maxAttempts);
+      await handleFailure(deliveryId, message, currentAttempts, maxAttempts, {
+        notificationId: delivery.notificationId,
+        channel: delivery.channel,
+      });
     }
 
     await rollUpNotificationStatus(delivery.notificationId);
@@ -2419,16 +3392,20 @@ async function handleFailure(
   lastError: string,
   attempts: number,
   maxAttempts: number,
+  meta: {
+    notificationId: string;
+    channel: DeliveryChannel;
+  },
 ) {
   if (attempts < maxAttempts) {
     const delayMs = calculateBackoffMs(attempts);
     // Mark FAILED (visible), then QUEUED so the delayed job can CAS
-    
+
     await prisma.$transaction(async (tx) => {
-     await tx.delivery.update({
+      await tx.delivery.update({
         where: { id: deliveryId },
-        data:{status:"FAILED"}
-      })
+        data: { status: "FAILED", lastError },
+      });
       await tx.outbox.create({
         data: {
           eventId: crypto.randomUUID(),
@@ -2436,11 +3413,17 @@ async function handleFailure(
           aggregateType: "Delivery",
           aggregateId: deliveryId,
           payload: {
-            deliveryId, 
-          }
-        }
-      })
-    })
+            deliveryId,
+            notificationId: meta.notificationId,
+            channel: meta.channel,
+            lastError,
+            attempts,
+            maxAttempts,
+            willRetry: true,
+          },
+        },
+      });
+    });
     await prisma.delivery.update({
       where: { id: deliveryId },
       data: { status: "QUEUED" },
@@ -2456,8 +3439,8 @@ async function handleFailure(
     await prisma.$transaction(async (tx) => {
       await tx.delivery.update({
         where: { id: deliveryId },
-        data: { status: "DEAD",lastError }
-      })
+        data: { status: "DEAD", lastError },
+      });
       await tx.outbox.create({
         data: {
           eventId: crypto.randomUUID(),
@@ -2466,11 +3449,16 @@ async function handleFailure(
           aggregateId: deliveryId,
           payload: {
             deliveryId,
-            lastError
-          }
-        }
-      })
-    })
+            notificationId: meta.notificationId,
+            channel: meta.channel,
+            lastError,
+            attempts,
+            maxAttempts,
+          },
+        },
+      });
+    });
+    deliveriesDeadTotal.inc({ channel: meta.channel });
 
     logger.warn("Delivery moved to DEAD", {
       deliveryId,
@@ -2595,105 +3583,128 @@ FILE: packages/database/tsconfig.json
 
 
 ================================================
+FILE: packages/database/.env.example
+================================================
+DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
+
+
+
+================================================
 FILE: packages/database/prisma/schema.prisma
 ================================================
 generator client {
   provider = "prisma-client"
-   output   = "../src/generated/prisma"
+  output   = "../src/generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
 }
 
-enum NotificationStatus{
-PENDING
-DELIVERED
-PARTIAL
-FAILED
+enum NotificationStatus {
+  PENDING
+  DELIVERED
+  PARTIAL
+  FAILED
 }
 
-enum DeliveryChannel{
-IN_APP
-EMAIL
-SMS
-PUSH
-}
-enum DeliveryStatus{
-QUEUED
-SENDING
-SENT
-FAILED
-DEAD
+enum DeliveryChannel {
+  IN_APP
+  EMAIL
+  SMS
+  PUSH
 }
 
-model Notification{
-id                   String          @id @default(uuid())
-status                NotificationStatus    @default(PENDING)
-userId                 String
-body                String
-createdAt               DateTime          @default(now())
-readAt                  DateTime?
-tenantId                 String?
-type                      String
-title                      String
-data                        Json?
-updatedAt                   DateTime           @updatedAt
-
-@@index([userId,createdAt])
-@@index([tenantId,userId])
-deliveries      Delivery[]
+enum DeliveryStatus {
+  QUEUED
+  SENDING
+  SENT
+  FAILED
+  DEAD
 }
 
-model Delivery{
-id                          String     @id @default(uuid())
-notificationId               String
-channel                       DeliveryChannel
-status                         DeliveryStatus   @default(QUEUED)
-attempts                        Int              @default(0)
-maxAttempts                      Int              @default(3)
-lastError                         String?
-providerMessageId                  String?
-sentAt                              DateTime?
-createdAt                          DateTime  @default(now())
-updatedAt                           DateTime  @updatedAt
+model Notification {
+  id        String             @id @default(uuid())
+  status    NotificationStatus @default(PENDING)
+  userId    String
+  body      String
+  createdAt DateTime           @default(now())
+  readAt    DateTime?
+  tenantId  String?
+  type      String
+  title     String
+  data      Json?
+  updatedAt DateTime           @updatedAt
 
-notification           Notification @relation(fields:[notificationId],references:[id],onDelete:Cascade)
+  deliveries Delivery[]
 
-@@unique([notificationId,channel])
-@@index([status, createdAt])
-@@index([notificationId])
+  @@index([userId, createdAt])
+  @@index([tenantId, userId])
+  @@index([tenantId, userId, createdAt])
+  @@index([tenantId, status])
 }
 
-model NotificationPreference{
-id                    String        @id @default(uuid())
-userId                String
-channel                DeliveryChannel
-enabled                Boolean         @default(true)
-createdAt DateTime        @default(now())
+model Delivery {
+  id                String          @id @default(uuid())
+  notificationId    String
+  channel           DeliveryChannel
+  status            DeliveryStatus  @default(QUEUED)
+  attempts          Int             @default(0)
+  maxAttempts       Int             @default(3)
+  lastError         String?
+  providerMessageId String?
+  sentAt            DateTime?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  @@unique([notificationId, channel])
+  @@index([status, createdAt])
+  @@index([notificationId])
+}
+
+model NotificationPreference {
+  id        String          @id @default(uuid())
+  userId    String
+  channel   DeliveryChannel
+  enabled   Boolean         @default(true)
+  createdAt DateTime        @default(now())
   updatedAt DateTime        @updatedAt
 
-  @@unique([userId,channel])
+  @@unique([userId, channel])
   @@index([userId])
 }
 
-model Outbox{
-id                    String        @id @default(uuid())
-eventId                String         @unique
-eventType               String
-aggregateType        String                     // "Notification" | "Delivery"
-aggregateId          String                     // notificationId or deliveryId
-createdAt     DateTime  @default(now())
-payload            Json
-publishedAt         DateTime?
-attempts            Int              @default(0)
-lastError             String?
+model Outbox {
+  id            String    @id @default(uuid())
+  eventId       String    @unique
+  eventType     String
+  aggregateType String
+  aggregateId   String
+  createdAt     DateTime  @default(now())
+  payload       Json
+  publishedAt   DateTime?
+  attempts      Int       @default(0)
+  lastError     String?
 
-
-  @@index([publishedAt, createdAt])        // publisher poll
-    @@index([aggregateType, aggregateId])
+  @@index([publishedAt, createdAt])
+  @@index([aggregateType, aggregateId])
 }
 
+
+model IdempotencyKey {
+  id             String   @id @default(uuid())
+  key            String
+  tenantId       String?
+  notificationId String
+  createdAt      DateTime @default(now())
+
+  /// Scope keys per tenant when tenantId is present; global when null
+  @@unique([tenantId, key])
+  @@index([createdAt])
+  @@index([notificationId])
+}
 
 
 ================================================

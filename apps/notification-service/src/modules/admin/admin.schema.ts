@@ -6,12 +6,13 @@ export const ListDeliveriesQuerySchema = z.object({
       .default("DEAD"),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(20).default(20),
-    channel: z.enum(["IN_APP", "EMAIL", "SMS", "PUSH"]).optional(),
+  channel: z.enum(["IN_APP", "EMAIL", "SMS", "PUSH"]).optional(),
+    tenantId: z.string().min(1).optional(),
 })
 export type ListDeliveriesQuery = z.infer<typeof ListDeliveriesQuerySchema>;
 
 export const DeliveryIdParamsSchema = z.object({
-  id: z.string().uuid("Invalid delivery id"),
+  id: z.uuid("Invalid delivery id"),
 });
 
 export type DeliveryIdParams = z.infer<typeof DeliveryIdParamsSchema>;

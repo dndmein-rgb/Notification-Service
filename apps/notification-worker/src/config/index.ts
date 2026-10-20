@@ -14,6 +14,7 @@ const envSchema = z.object({
   SMTP_HOST: z.string().default("localhost"),
   SMTP_PORT: z.coerce.number().default(1025),
   SMTP_FROM: z.string().default("noreply@notification.local"),
+  METRICS_PORT: z.coerce.number().default(3001),
 });
 
 const parsed = envSchema.safeParse(process.env);

@@ -6,13 +6,17 @@ export class AdminRepository implements AdminInterface {
   async listDeliveries(params: {
     status?: DeliveryStatus;
     channel?: string;
+    tenantId?: string;
     page: number;
     limit: number;
   }): Promise<{ data: Delivery[]; total: number }> {
-    const { limit, status, channel, page } = params;
+    const { limit, status, channel, page ,tenantId} = params;
     const where: Record<string, unknown> = {};
     if (status) where.status = status;
-    if (channel) where.status = channel;
+    if (channel) where.channel = channel;
+    if (tenantId) {
+        where.notification = { tenantId };
+      }
     const [data, total] = await Promise.all([
       prisma.delivery.findMany({
         where,
@@ -27,6 +31,7 @@ export class AdminRepository implements AdminInterface {
               title: true,
               type: true,
               status: true,
+              tenantId:true
             },
           },
         },

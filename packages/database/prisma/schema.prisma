@@ -1,96 +1,113 @@
 generator client {
   provider = "prisma-client"
-   output   = "../src/generated/prisma"
+  output   = "../src/generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
 }
 
-enum NotificationStatus{
-PENDING
-DELIVERED
-PARTIAL
-FAILED
+enum NotificationStatus {
+  PENDING
+  DELIVERED
+  PARTIAL
+  FAILED
 }
 
-enum DeliveryChannel{
-IN_APP
-EMAIL
-SMS
-PUSH
-}
-enum DeliveryStatus{
-QUEUED
-SENDING
-SENT
-FAILED
-DEAD
+enum DeliveryChannel {
+  IN_APP
+  EMAIL
+  SMS
+  PUSH
 }
 
-model Notification{
-id                   String          @id @default(uuid())
-status                NotificationStatus    @default(PENDING)
-userId                 String
-body                String
-createdAt               DateTime          @default(now())
-readAt                  DateTime?
-tenantId                 String?
-type                      String
-title                      String
-data                        Json?
-updatedAt                   DateTime           @updatedAt
-
-@@index([userId,createdAt])
-@@index([tenantId,userId])
-deliveries      Delivery[]
+enum DeliveryStatus {
+  QUEUED
+  SENDING
+  SENT
+  FAILED
+  DEAD
 }
 
-model Delivery{
-id                          String     @id @default(uuid())
-notificationId               String
-channel                       DeliveryChannel
-status                         DeliveryStatus   @default(QUEUED)
-attempts                        Int              @default(0)
-maxAttempts                      Int              @default(3)
-lastError                         String?
-providerMessageId                  String?
-sentAt                              DateTime?
-createdAt                          DateTime  @default(now())
-updatedAt                           DateTime  @updatedAt
+model Notification {
+  id        String             @id @default(uuid())
+  status    NotificationStatus @default(PENDING)
+  userId    String
+  body      String
+  createdAt DateTime           @default(now())
+  readAt    DateTime?
+  tenantId  String?
+  type      String
+  title     String
+  data      Json?
+  updatedAt DateTime           @updatedAt
 
-notification           Notification @relation(fields:[notificationId],references:[id],onDelete:Cascade)
+  deliveries Delivery[]
 
-@@unique([notificationId,channel])
-@@index([status, createdAt])
-@@index([notificationId])
+  @@index([userId, createdAt])
+  @@index([tenantId, userId])
+  @@index([tenantId, userId, createdAt])
+  @@index([tenantId, status])
 }
 
-model NotificationPreference{
-id                    String        @id @default(uuid())
-userId                String
-channel                DeliveryChannel
-enabled                Boolean         @default(true)
-createdAt DateTime        @default(now())
+model Delivery {
+  id                String          @id @default(uuid())
+  notificationId    String
+  channel           DeliveryChannel
+  status            DeliveryStatus  @default(QUEUED)
+  attempts          Int             @default(0)
+  maxAttempts       Int             @default(3)
+  lastError         String?
+  providerMessageId String?
+  sentAt            DateTime?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  @@unique([notificationId, channel])
+  @@index([status, createdAt])
+  @@index([notificationId])
+}
+
+model NotificationPreference {
+  id        String          @id @default(uuid())
+  userId    String
+  channel   DeliveryChannel
+  enabled   Boolean         @default(true)
+  createdAt DateTime        @default(now())
   updatedAt DateTime        @updatedAt
 
-  @@unique([userId,channel])
+  @@unique([userId, channel])
   @@index([userId])
 }
 
-model Outbox{
-id                    String        @id @default(uuid())
-eventId                String         @unique
-eventType               String
-aggregateType        String                     // "Notification" | "Delivery"
-aggregateId          String                     // notificationId or deliveryId
-createdAt     DateTime  @default(now())
-payload            Json
-publishedAt         DateTime?
-attempts            Int              @default(0)
-lastError             String?
+model Outbox {
+  id            String    @id @default(uuid())
+  eventId       String    @unique
+  eventType     String
+  aggregateType String
+  aggregateId   String
+  createdAt     DateTime  @default(now())
+  payload       Json
+  publishedAt   DateTime?
+  attempts      Int       @default(0)
+  lastError     String?
+
+  @@index([publishedAt, createdAt])
+  @@index([aggregateType, aggregateId])
+}
 
 
-  @@index([publishedAt, createdAt])        // publisher poll
-    @@index([aggregateType, aggregateId])
+model IdempotencyKey {
+  id             String   @id @default(uuid())
+  key            String
+  tenantId       String?
+  notificationId String
+  createdAt      DateTime @default(now())
+
+  /// Scope keys per tenant when tenantId is present; global when null
+  @@unique([tenantId, key])
+  @@index([createdAt])
+  @@index([notificationId])
 }

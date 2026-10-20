@@ -11,7 +11,10 @@ import { InAppAdapter } from "./adapters/in-app.adapter.js";
 import { EmailAdapter } from "./adapters/email.adapter.js";
 import type { DeliveryChannel } from "@notification/database";
 import type { ChannelAdapter } from "./adapters/channel-adapter.interface.js";
-import { startOutboxPublisher } from "./infrastructure/outbox-publisher.js";
+import { startOutboxPublisher, stopOutboxPublisher } from "./infrastructure/outbox-publisher.js";
+import { SmsAdapter } from "./adapters/sms.adapter.js";
+import { PushAdapter } from "./adapters/push.adapter.js";
+import { startOpsServer } from "./infrastructure/http-ops.js";
 
 async function main() {
   const connection = createRedisConnection();
@@ -19,6 +22,8 @@ async function main() {
   const adapters = new Map<DeliveryChannel, ChannelAdapter>([
     ["IN_APP", new InAppAdapter()],
     ["EMAIL", new EmailAdapter()],
+    ["SMS", new SmsAdapter()],
+    ["PUSH",new PushAdapter()]
   ]);
 
   const processor = createDeliveryProcessor(adapters);
@@ -43,12 +48,15 @@ async function main() {
       error: err.message,
     });
   });
+  const opsServer = startOpsServer();
 await startOutboxPublisher();
   logger.info(`notification-worker started (queue=${DELIVERY_QUEUE_NAME})`);
 
   const shutdown = async (signal: string) => {
     logger.info(`Shutting down worker (${signal})`);
     await worker.close();
+    await stopOutboxPublisher();
+    opsServer.close();
     await connection.quit();
     await prisma.$disconnect();
     process.exit(0);
