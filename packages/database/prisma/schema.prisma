@@ -77,3 +77,20 @@ createdAt DateTime        @default(now())
   @@unique([userId,channel])
   @@index([userId])
 }
+
+model Outbox{
+id                    String        @id @default(uuid())
+eventId                String         @unique
+eventType               String
+aggregateType        String                     // "Notification" | "Delivery"
+aggregateId          String                     // notificationId or deliveryId
+createdAt     DateTime  @default(now())
+payload            Json
+publishedAt         DateTime?
+attempts            Int              @default(0)
+lastError             String?
+
+
+  @@index([publishedAt, createdAt])        // publisher poll
+    @@index([aggregateType, aggregateId])
+}

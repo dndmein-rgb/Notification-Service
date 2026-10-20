@@ -6,7 +6,7 @@ const envSchema = z.object({
   LOG_LEVEL: z.string().default("info"),
   DATABASE_URL: z.string(),
   REDIS_URL: z.string(),
-
+  KAFKA_BROKERS: z.string().default("localhost:9092"),
   EMAIL_ENABLED: z
     .enum(["true", "false"])
     .default("true")

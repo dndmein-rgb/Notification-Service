@@ -16,6 +16,7 @@
     "nodemailer": "^10.x",
     "pg": "^8.x",
     "pino": "^9.x",
-    "zod": "^4.x"
+    "zod": "^4.x",
+    "kafkajs": "^2.2.4"
   }
 }

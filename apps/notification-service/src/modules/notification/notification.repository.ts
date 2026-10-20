@@ -1,11 +1,21 @@
-import { Delivery, Notification, NotificationStatus } from "@notification/database";
+import {
+  Delivery,
+  Notification,
+  NotificationStatus,
+} from "@notification/database";
 import { NotificationInterface } from "./notification.interface.js";
-import { CreateNotificationWriteData, NotificationWithDeliveries, UpdateDeliveryData } from "./notification.types.js";
+import {
+  CreateNotificationWriteData,
+  NotificationWithDeliveries,
+  UpdateDeliveryData,
+} from "./notification.types.js";
 import { prisma } from "../../infrastructure/prisma.js";
 
 export class NotificationRepository implements NotificationInterface {
-  async create(data: CreateNotificationWriteData): Promise<NotificationWithDeliveries> {
-    const { channels, status, ...notificationData } = data
+  async create(
+    data: CreateNotificationWriteData,
+  ): Promise<NotificationWithDeliveries> {
+    const { channels, status, ...notificationData } = data;
     return prisma.$transaction(async (tx) => {
       const notification = await tx.notification.create({
         data: {
@@ -15,15 +25,34 @@ export class NotificationRepository implements NotificationInterface {
             create: channels.map((channel) => ({
               channel,
               status: "QUEUED",
-              maxAttempts:3
-            }))
-          }
+              maxAttempts: 3,
+            })),
+          },
         },
-        include:{deliveries:true}
-        
-      })
+        include: { deliveries: true },
+      });
+
+      await tx.outbox.create({
+        data: {
+          eventId: crypto.randomUUID(),
+          eventType: "notification.created",
+          aggregateType: "Notification",
+          aggregateId: notification.id,
+          payload: {
+            notificationId: notification.id,
+            userId: notification.userId,
+            tenantId: notification.tenantId,
+            type: notification.type,
+            title: notification.title,
+            body: notification.body,
+            channels: notification.deliveries.map((d) => d.channel),
+            createdAt: notification.createdAt.toISOString(),
+          },
+        },
+      });
+
       return notification;
-    })
+    });
   }
 
   async findByUserId(params: {
@@ -60,43 +89,66 @@ export class NotificationRepository implements NotificationInterface {
     return { data, total };
   }
 
-
-
-    async findById(id:string):Promise<Notification|null>{
-    return prisma.notification.findUnique({
-      where:{id}
-    })
-    }
-
-  async findByIdWithDeliveries(id: string): Promise<NotificationWithDeliveries | null> {
+  async findById(id: string): Promise<Notification | null> {
     return prisma.notification.findUnique({
       where: { id },
-      include:{deliveries:true}
-    })
+    });
   }
-  async markAsRead(id: string): Promise<Notification > {
-    return prisma.notification.update({
+
+  async findByIdWithDeliveries(
+    id: string,
+  ): Promise<NotificationWithDeliveries | null> {
+    return prisma.notification.findUnique({
       where: { id },
-      data:{readAt:new Date()}
+      include: { deliveries: true },
+    });
+  }
+  async markAsRead(id: string): Promise<Notification> {
+    return await prisma.$transaction(async (tx) => {
+      const notification = await tx.notification.update({
+        where: { id },
+        data:{readAt:new Date()}
+      })
+      await tx.outbox.create({
+        data: {
+          eventId: crypto.randomUUID(),
+          eventType: "notification.read",
+          aggregateType: "Notification",
+          aggregateId: id,
+          payload: {
+            notificationId: id,
+            userId: notification.userId,
+            readAt: notification.readAt!.toISOString(),
+          }
+        }
+      })
+      return notification;
     })
   }
-  async updateDelivery(deliveryId: string, data: UpdateDeliveryData): Promise<Delivery> {
+  async updateDelivery(
+    deliveryId: string,
+    data: UpdateDeliveryData,
+  ): Promise<Delivery> {
     return prisma.delivery.update({
       where: { id: deliveryId },
-      data
-    })
+      data,
+    });
   }
-  async updateNotificationStatus(id: string, status: NotificationStatus): Promise<Notification> {
+  async updateNotificationStatus(
+    id: string,
+    status: NotificationStatus,
+  ): Promise<Notification> {
     return prisma.notification.update({
       where: { id },
-      data:{status}
-    })
+      data: { status },
+    });
   }
-  async getDeliveriesByNotificationId(notificationId: string): Promise<Delivery[]> {
+  async getDeliveriesByNotificationId(
+    notificationId: string,
+  ): Promise<Delivery[]> {
     return prisma.delivery.findMany({
       where: { notificationId },
       orderBy: { createdAt: "asc" },
-    })
+    });
   }
 }
-  

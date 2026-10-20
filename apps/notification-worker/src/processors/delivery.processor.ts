@@ -69,6 +69,7 @@ export function createDeliveryProcessor(
         `No adapter for channel ${delivery.channel}`,
         currentAttempts,
         maxAttempts,
+        {notificationId:delivery.notificationId,channel:delivery.channel}
       );
       await rollUpNotificationStatus(delivery.notificationId);
       return;
@@ -83,14 +84,32 @@ export function createDeliveryProcessor(
         data: delivery.notification.data ?? undefined,
       });
 
-      await prisma.delivery.update({
-        where: { id: deliveryId },
-        data: {
-          status: "SENT",
-          sentAt: new Date(),
-          providerMessageId: result.providerMessageId ?? null,
-          lastError: null,
-        },
+      await prisma.$transaction(async (tx) => {
+        await tx.delivery.update({
+          where: { id: deliveryId },
+          data: {
+            status: "SENT",
+            sentAt: new Date(),
+            providerMessageId: result.providerMessageId ?? null,
+            lastError: null,
+          },
+        });
+      
+        await tx.outbox.create({
+          data: {
+            eventId: crypto.randomUUID(),
+            eventType: "delivery.sent",
+            aggregateType: "Delivery",
+            aggregateId: deliveryId,
+            payload: {
+              deliveryId,
+              notificationId: delivery.notificationId,
+              channel: delivery.channel,
+              providerMessageId: result.providerMessageId,
+              sentAt: new Date().toISOString(),
+            },
+          },
+        });
       });
 
       logger.info("Delivery sent", {
@@ -105,7 +124,7 @@ export function createDeliveryProcessor(
         channel: delivery.channel,
         error: message,
       });
-      await handleFailure(deliveryId, message, currentAttempts, maxAttempts);
+      await handleFailure(deliveryId, message, currentAttempts, maxAttempts,{notificationId:delivery.notificationId,channel:delivery.channel});
     }
 
     await rollUpNotificationStatus(delivery.notificationId);
@@ -120,14 +139,38 @@ async function handleFailure(
   lastError: string,
   attempts: number,
   maxAttempts: number,
+  meta: {
+      notificationId: string;
+      channel: DeliveryChannel;
+    },
 ) {
   if (attempts < maxAttempts) {
     const delayMs = calculateBackoffMs(attempts);
     // Mark FAILED (visible), then QUEUED so the delayed job can CAS
-    await prisma.delivery.update({
-      where: { id: deliveryId },
-      data: { status: "FAILED", lastError },
-    });
+    
+    await prisma.$transaction(async (tx) => {
+     await tx.delivery.update({
+        where: { id: deliveryId },
+        data:{status:"FAILED",lastError}
+      })
+      await tx.outbox.create({
+        data: {
+          eventId: crypto.randomUUID(),
+          eventType: "delivery.failed",
+          aggregateType: "Delivery",
+          aggregateId: deliveryId,
+          payload: {
+            deliveryId,
+            notificationId: meta.notificationId,
+            channel: meta.channel,
+            lastError,
+            attempts,
+            maxAttempts,
+            willRetry:true
+          }
+        }
+      })
+    })
     await prisma.delivery.update({
       where: { id: deliveryId },
       data: { status: "QUEUED" },
@@ -140,10 +183,28 @@ async function handleFailure(
       delayMs,
     });
   } else {
-    await prisma.delivery.update({
-      where: { id: deliveryId },
-      data: { status: "DEAD", lastError },
-    });
+    await prisma.$transaction(async (tx) => {
+      await tx.delivery.update({
+        where: { id: deliveryId },
+        data: { status: "DEAD",lastError }
+      })
+      await tx.outbox.create({
+        data: {
+          eventId: crypto.randomUUID(),
+          eventType: "delivery.dead",
+          aggregateType: "Delivery",
+          aggregateId: deliveryId,
+          payload: {
+            deliveryId,
+                        notificationId: meta.notificationId,
+                        channel: meta.channel,
+                        lastError,
+                        attempts,
+                        maxAttempts,
+          }
+        }
+      })
+    })
 
     logger.warn("Delivery moved to DEAD", {
       deliveryId,

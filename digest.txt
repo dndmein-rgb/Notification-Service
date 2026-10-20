@@ -3,12 +3,10 @@ Directory structure:
     ├── docker-compose.yml
     ├── package.json
     ├── tsconfig.base.json
-    ├── .env.example
     ├── apps/
     │   ├── notification-service/
     │   │   ├── package.json
     │   │   ├── tsconfig.json
-    │   │   ├── .env.example
     │   │   └── src/
     │   │       ├── app.ts
     │   │       ├── server.ts
@@ -19,28 +17,44 @@ Directory structure:
     │   │       │   ├── prisma.ts
     │   │       │   └── queue.ts
     │   │       ├── middlewares/
+    │   │       │   ├── admin-auth.middleware.ts
     │   │       │   ├── cors.middleware.ts
     │   │       │   ├── error.middleware.ts
     │   │       │   ├── req.middleware.ts
     │   │       │   └── validate.middleware.ts
     │   │       └── modules/
-    │   │           └── notification/
-    │   │               ├── notification.container.ts
-    │   │               ├── notification.controller.ts
-    │   │               ├── notification.interface.ts
-    │   │               ├── notification.repository.ts
-    │   │               ├── notification.route.ts
-    │   │               ├── notification.schema.ts
-    │   │               ├── notification.service.ts
-    │   │               ├── notification.types.ts
-    │   │               └── adapters/
-    │   │                   ├── channel-adapter.interface.ts
-    │   │                   ├── email.adapter.ts
-    │   │                   └── in-app.adapter.ts
+    │   │           ├── admin/
+    │   │           │   ├── admin.container.ts
+    │   │           │   ├── admin.controller.ts
+    │   │           │   ├── admin.interface.ts
+    │   │           │   ├── admin.repository.ts
+    │   │           │   ├── admin.route.ts
+    │   │           │   ├── admin.schema.ts
+    │   │           │   └── admin.service.ts
+    │   │           ├── notification/
+    │   │           │   ├── notification.container.ts
+    │   │           │   ├── notification.controller.ts
+    │   │           │   ├── notification.interface.ts
+    │   │           │   ├── notification.repository.ts
+    │   │           │   ├── notification.route.ts
+    │   │           │   ├── notification.schema.ts
+    │   │           │   ├── notification.service.ts
+    │   │           │   ├── notification.types.ts
+    │   │           │   └── adapters/
+    │   │           │       ├── channel-adapter.interface.ts
+    │   │           │       ├── email.adapter.ts
+    │   │           │       └── in-app.adapter.ts
+    │   │           └── preference/
+    │   │               ├── preference.container.ts
+    │   │               ├── preference.controller.ts
+    │   │               ├── preference.interface.ts
+    │   │               ├── preference.repository.ts
+    │   │               ├── preference.route.ts
+    │   │               ├── preference.schema.ts
+    │   │               └── preference.service.ts
     │   └── notification-worker/
     │       ├── package.json
     │       ├── tsconfig.json
-    │       ├── .env.example
     │       └── src/
     │           ├── index.ts
     │           ├── adapters/
@@ -51,6 +65,7 @@ Directory structure:
     │           │   ├── index.ts
     │           │   └── logger.ts
     │           ├── infrastructure/
+    │           │   ├── outbox-publisher.ts
     │           │   ├── prisma.ts
     │           │   └── queue.ts
     │           └── processors/
@@ -60,7 +75,6 @@ Directory structure:
         │   ├── package.json
         │   ├── prisma.config.ts
         │   ├── tsconfig.json
-        │   ├── .env.example
         │   ├── prisma/
         │   │   └── schema.prisma
         │   └── src/
@@ -218,31 +232,6 @@ FILE: tsconfig.base.json
 
 
 ================================================
-FILE: .env.example
-================================================
-# Server
-NODE_ENV=development
-PORT=3000
-LOG_LEVEL=info
-
-# Database
-DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
-
-# Redis
-REDIS_URL=redis://localhost:6379
-
-# Kafka
-KAFKA_BROKERS=localhost:9092
-
-# Admin
-ADMIN_API_KEY=dev-admin-key-change-me
-
-# Mailhog (later)
-SMTP_HOST=localhost
-SMTP_PORT=1025
-
-
-================================================
 FILE: apps/notification-service/package.json
 ================================================
 {
@@ -297,43 +286,17 @@ FILE: apps/notification-service/tsconfig.json
 
 
 ================================================
-FILE: apps/notification-service/.env.example
-================================================
-# Server
-NODE_ENV=development
-PORT=3000
-LOG_LEVEL=info
-
-# Database
-DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
-
-# Redis
-REDIS_URL=redis://localhost:6379
-
-# Kafka
-KAFKA_BROKERS=localhost:9092
-
-# Admin
-ADMIN_API_KEY=dev-admin-key-change-me
-
-# Mailhog (later)
-EMAIL_ENABLED=true
-SMTP_FROM=noreply@notification.local
-SMTP_HOST=localhost
-SMTP_PORT=1025
-
-CLIENT_ORIGINS=http://localhost:5173
-
-
-================================================
 FILE: apps/notification-service/src/app.ts
 ================================================
 import express from "express";
+
 import { requestLogger } from "./middlewares/req.middleware.js";
 import { corsMiddleware } from "./middlewares/cors.middleware.js";
-
-import notificationRoutes from "./modules/notification/notification.route.js"
 import { errorMiddleware } from "./middlewares/error.middleware.js";
+
+import adminRoutes from "./modules/admin/admin.route.js"
+import notificationRoutes from "./modules/notification/notification.route.js"
+import preferenceRoutes from "./modules/preference/preference.route.js"
 
 export function createApp() {
   const app = express();
@@ -343,8 +306,10 @@ export function createApp() {
   app.use(requestLogger)
 
   
+  app.use("/admin", adminRoutes);
   app.use("/notifications",notificationRoutes)
-
+  app.use("/users/:userId/preferences", preferenceRoutes);
+  
   app.get("/health", (_req, res) => {
     res.status(200).json({
       status: "ok",
@@ -559,24 +524,57 @@ const connection = new IORedis(config.REDIS_URL, {
   maxRetriesPerRequest: null,
 });
 
-export const deliveryQueue = new Queue<ProcessDeliveryJob>(DELIVERY_QUEUE_NAME, {
-  connection,
-});
+export const deliveryQueue = new Queue<ProcessDeliveryJob>(
+  DELIVERY_QUEUE_NAME,
+  {
+    connection,
+  },
+);
 
 /**
- * Enqueue one delivery job.
- * Call this AFTER the DB transaction that created the Delivery row has committed.
+ * Enqueue one delivery job (create path + admin retry).
  */
+export async function enqueueDelivery(
+  deliveryId: string,
+  delayMs = 0,
+): Promise<void> {
+  const jobId = `delivery-${deliveryId}-${Date.now()}`;
 
-export async function enqueueDelivery(deliveryId: string): Promise<void>{
-  await deliveryQueue.add(DELIVERY_JOB_NAME, { deliveryId }, {
-    jobId: `delivery-${deliveryId}`,// idempotent: same deliveryId â†’ same job
-    removeOnComplete: 1000,
-    removeOnFail:5000
-  })
-  logger.debug("Enqueued delivery job", { deliveryId });
+  await deliveryQueue.add(
+    DELIVERY_JOB_NAME,
+    { deliveryId },
+    {
+      jobId,
+      delay: delayMs > 0 ? delayMs : undefined,
+      removeOnComplete: 1000,
+      removeOnFail: 5000,
+    },
+  );
+  logger.debug("Enqueued delivery job", { deliveryId, delayMs, jobId });
 }
 
+
+
+================================================
+FILE: apps/notification-service/src/middlewares/admin-auth.middleware.ts
+================================================
+import type { Request, Response, NextFunction } from "express";
+import { UnauthorizedError } from "@notification/shared-utils";
+import { config } from "../config/index.js";
+
+export function adminAuthMiddleware(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): void { 
+  const key = req.header("X-API-Key") ?? req.header("x-api-key")
+  if (!key || key !== config.ADMIN_API_KEY) {
+      next(new UnauthorizedError("Invalid or missing X-API-Key"));
+      return;
+    }
+  
+    next();
+}
 
 
 ================================================
@@ -712,6 +710,288 @@ export const validate =
 
 
 ================================================
+FILE: apps/notification-service/src/modules/admin/admin.container.ts
+================================================
+import { AdminRepository } from "./admin.repository";
+import { AdminService } from "./admin.service";
+
+const adminRepository = new AdminRepository();
+export const adminService=new AdminService(adminRepository)
+
+
+================================================
+FILE: apps/notification-service/src/modules/admin/admin.controller.ts
+================================================
+import { asyncHandler } from "@notification/shared-utils";
+import type { Request, Response } from "express";
+import type { ListDeliveriesQuery } from "./admin.schema.js";
+import { adminService } from "./admin.container.js";
+
+export const listDeliveries = asyncHandler(async (req: Request, res: Response) => {
+  const query = res.locals.validatedQuery as ListDeliveriesQuery;
+  const result = await adminService.listDeliveries({
+    status: query.status as any,
+    channel: query.channel,
+    page: query.page,
+    limit: query.limit,
+  });
+
+  res.status(200).json({
+    success: true,
+    data: result.data,
+    meta: result.meta,
+  });
+});
+
+export const retryDelivery = asyncHandler(async (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  const result = await adminService.retryDelivery(id);
+
+  res.status(200).json({
+    success: true,
+    message: "Delivery re-queued for retry",
+    data: result,
+  });
+});
+
+export const getStats = asyncHandler(async (_req: Request, res: Response) => {
+  const stats = await adminService.getStats();
+  res.status(200).json({ success: true, data: stats });
+});
+
+
+================================================
+FILE: apps/notification-service/src/modules/admin/admin.interface.ts
+================================================
+import type { Delivery, DeliveryStatus } from "@notification/database";
+
+export interface AdminInterface {
+  listDeliveries(params: {
+    status?: DeliveryStatus,
+    channel?: string;
+    page: number;
+    limit: number
+  }): Promise<{ data: Delivery[], total: number }>
+  findDeliverybyId(id: string): Promise<Delivery | null>
+   resetDeliveryForRetry(id: string): Promise<Delivery>
+    getStats(): Promise<{
+       deliveriesByStatus: Record<string, number>;
+       notificationsByStatus: Record<string, number>;
+     }>
+}
+
+
+================================================
+FILE: apps/notification-service/src/modules/admin/admin.repository.ts
+================================================
+import { DeliveryStatus, Delivery } from "@notification/database";
+import { AdminInterface } from "./admin.interface";
+import { prisma } from "../../infrastructure/prisma.js";
+
+export class AdminRepository implements AdminInterface {
+  async listDeliveries(params: {
+    status?: DeliveryStatus;
+    channel?: string;
+    page: number;
+    limit: number;
+  }): Promise<{ data: Delivery[]; total: number }> {
+    const { limit, status, channel, page } = params;
+    const where: Record<string, unknown> = {};
+    if (status) where.status = status;
+    if (channel) where.status = channel;
+    const [data, total] = await Promise.all([
+      prisma.delivery.findMany({
+        where,
+        orderBy: { updatedAt: "desc" },
+        take: limit,
+        skip: (page - 1) * limit,
+        include: {
+          notification: {
+            select: {
+              id: true,
+              userId: true,
+              title: true,
+              type: true,
+              status: true,
+            },
+          },
+        },
+      }),
+      prisma.delivery.count({ where }),
+    ]);
+    return { data, total };
+  }
+  async findDeliverybyId(id: string): Promise<Delivery | null> {
+    return prisma.delivery.findUnique({
+      where: { id },
+      include: {
+        notification: {
+          select: {
+            id: true,
+            userId: true,
+            title: true,
+            type: true,
+            status:true
+          }
+        }
+      }
+    })
+  }
+  async resetDeliveryForRetry(id: string): Promise<Delivery> {
+    return prisma.delivery.update({
+      where: { id },
+      data: {
+        lastError:null
+        ,status:"QUEUED"
+      }
+    })
+  }
+  async getStats(): Promise<{
+      deliveriesByStatus: Record<string, number>;
+      notificationsByStatus: Record<string, number>;
+    }> {
+      const [deliveryGroups, notificationGroups] = await Promise.all([
+        prisma.delivery.groupBy({ by: ["status"], _count: { _all: true } }),
+        prisma.notification.groupBy({ by: ["status"], _count: { _all: true } }),
+      ]);
+  
+      const deliveriesByStatus: Record<string, number> = {
+        QUEUED: 0,
+        SENDING: 0,
+        SENT: 0,
+        FAILED: 0,
+        DEAD: 0,
+      };
+      for (const g of deliveryGroups) {
+        deliveriesByStatus[g.status] = g._count._all;
+      }
+  
+      const notificationsByStatus: Record<string, number> = {
+        PENDING: 0,
+        DELIVERED: 0,
+        PARTIAL: 0,
+        FAILED: 0,
+      };
+      for (const g of notificationGroups) {
+        notificationsByStatus[g.status] = g._count._all;
+      }
+  
+      return { deliveriesByStatus, notificationsByStatus };
+    }
+}
+
+
+
+================================================
+FILE: apps/notification-service/src/modules/admin/admin.route.ts
+================================================
+import express from "express";
+import { validate } from "../../middlewares/validate.middleware.js";
+import { adminAuthMiddleware } from "../../middlewares/admin-auth.middleware.js";
+import {
+  ListDeliveriesQuerySchema,
+  DeliveryIdParamsSchema,
+} from "./admin.schema.js";
+import { listDeliveries, retryDelivery, getStats } from "./admin.controller.js";
+
+const router = express.Router();
+
+router.use(adminAuthMiddleware);
+
+router
+  .route("/deliveries")
+  .get(validate(ListDeliveriesQuerySchema, "query"), listDeliveries);
+
+router
+  .route("/deliveries/:id/retry")
+  .post(validate(DeliveryIdParamsSchema, "params"), retryDelivery);
+
+router.route("/stats").get(getStats);
+
+export default router;
+
+
+================================================
+FILE: apps/notification-service/src/modules/admin/admin.schema.ts
+================================================
+import { z } from "zod"
+
+export const ListDeliveriesQuerySchema = z.object({
+  status:z.enum(["QUEUED", "SENDING", "SENT", "FAILED", "DEAD"])
+      .optional()
+      .default("DEAD"),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(20).default(20),
+    channel: z.enum(["IN_APP", "EMAIL", "SMS", "PUSH"]).optional(),
+})
+export type ListDeliveriesQuery = z.infer<typeof ListDeliveriesQuerySchema>;
+
+export const DeliveryIdParamsSchema = z.object({
+  id: z.string().uuid("Invalid delivery id"),
+});
+
+export type DeliveryIdParams = z.infer<typeof DeliveryIdParamsSchema>;
+
+
+================================================
+FILE: apps/notification-service/src/modules/admin/admin.service.ts
+================================================
+import type { DeliveryStatus } from "@notification/database";
+import { AdminInterface } from "./admin.interface";
+import { ConflictError, NotFoundError, ValidationError } from "@notification/shared-utils";
+import { enqueueDelivery } from "../../infrastructure/queue";
+import { logger } from "../../config/logger";
+
+export class AdminService {
+  constructor(private readonly repo: AdminInterface) { }
+
+  async listDeliveries(params: {
+    status?: DeliveryStatus;
+    channel?: string;
+    page: number;
+    limit: number;
+  }) {
+    const { data, total } = await this.repo.listDeliveries(params);
+    return {
+      data,
+      meta: {
+        page: params.page,
+        limit: params.limit,
+        total,
+        totalPages: Math.ceil(total / params.limit) || 0,
+      },
+    }
+  }
+  async retryDelivery(id: string) {
+    if (!id) throw new ValidationError("Delivery id is required");
+    const delivery = await this.repo.findDeliverybyId(id);
+    if (!delivery) throw new NotFoundError("Delivery", id);
+
+    if (delivery.status !== "DEAD" && delivery.status !== "FAILED") {
+      throw new ConflictError(
+              `Cannot retry delivery in status ${delivery.status}. Only DEAD or FAILED are allowed.`,
+            );
+    }
+    const updated = await this.repo.resetDeliveryForRetry(id);
+        await enqueueDelivery(id);
+    
+        logger.info("Admin forced retry of delivery", {
+          deliveryId: id,
+          previousStatus: delivery.status,
+        });
+    
+        return updated;
+      }
+    
+      async getStats() {
+        return this.repo.getStats();
+      }
+}
+
+
+
+
+================================================
 FILE: apps/notification-service/src/modules/notification/notification.container.ts
 ================================================
 import { NotificationRepository } from "./notification.repository.js";
@@ -812,14 +1092,24 @@ export interface NotificationInterface{
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.repository.ts
 ================================================
-import { Delivery, Notification, NotificationStatus } from "@notification/database";
+import {
+  Delivery,
+  Notification,
+  NotificationStatus,
+} from "@notification/database";
 import { NotificationInterface } from "./notification.interface.js";
-import { CreateNotificationWriteData, NotificationWithDeliveries, UpdateDeliveryData } from "./notification.types.js";
+import {
+  CreateNotificationWriteData,
+  NotificationWithDeliveries,
+  UpdateDeliveryData,
+} from "./notification.types.js";
 import { prisma } from "../../infrastructure/prisma.js";
 
 export class NotificationRepository implements NotificationInterface {
-  async create(data: CreateNotificationWriteData): Promise<NotificationWithDeliveries> {
-    const { channels, status, ...notificationData } = data
+  async create(
+    data: CreateNotificationWriteData,
+  ): Promise<NotificationWithDeliveries> {
+    const { channels, status, ...notificationData } = data;
     return prisma.$transaction(async (tx) => {
       const notification = await tx.notification.create({
         data: {
@@ -829,15 +1119,34 @@ export class NotificationRepository implements NotificationInterface {
             create: channels.map((channel) => ({
               channel,
               status: "QUEUED",
-              maxAttempts:3
-            }))
-          }
+              maxAttempts: 3,
+            })),
+          },
         },
-        include:{deliveries:true}
-        
-      })
+        include: { deliveries: true },
+      });
+
+      await tx.outbox.create({
+        data: {
+          eventId: crypto.randomUUID(),
+          eventType: "notification.created",
+          aggregateType: "Notification",
+          aggregateId: notification.id,
+          payload: {
+            notificationId: notification.id,
+            userId: notification.userId,
+            tenantId: notification.tenantId,
+            type: notification.type,
+            title: notification.title,
+            body: notification.body,
+            channels: notification.deliveries.map((d) => d.channel),
+            createdAt: notification.createdAt.toISOString(),
+          },
+        },
+      });
+
       return notification;
-    })
+    });
   }
 
   async findByUserId(params: {
@@ -874,46 +1183,70 @@ export class NotificationRepository implements NotificationInterface {
     return { data, total };
   }
 
-
-
-    async findById(id:string):Promise<Notification|null>{
-    return prisma.notification.findUnique({
-      where:{id}
-    })
-    }
-
-  async findByIdWithDeliveries(id: string): Promise<NotificationWithDeliveries | null> {
+  async findById(id: string): Promise<Notification | null> {
     return prisma.notification.findUnique({
       where: { id },
-      include:{deliveries:true}
-    })
+    });
   }
-  async markAsRead(id: string): Promise<Notification > {
-    return prisma.notification.update({
+
+  async findByIdWithDeliveries(
+    id: string,
+  ): Promise<NotificationWithDeliveries | null> {
+    return prisma.notification.findUnique({
       where: { id },
-      data:{readAt:new Date()}
+      include: { deliveries: true },
+    });
+  }
+  async markAsRead(id: string): Promise<Notification> {
+    return await prisma.$transaction(async (tx) => {
+      const notification = await tx.notification.update({
+        where: { id },
+        data:{readAt:new Date()}
+      })
+      await tx.outbox.create({
+        data: {
+          eventId: crypto.randomUUID(),
+          eventType: "notification.read",
+          aggregateType: "Notification",
+          aggregateId: id,
+          payload: {
+            notificationId: id,
+            userId: notification.userId,
+            readAt: notification.readAt!.toISOString(),
+          }
+        }
+      })
+      return notification;
     })
   }
-  async updateDelivery(deliveryId: string, data: UpdateDeliveryData): Promise<Delivery> {
+  async updateDelivery(
+    deliveryId: string,
+    data: UpdateDeliveryData,
+  ): Promise<Delivery> {
     return prisma.delivery.update({
       where: { id: deliveryId },
-      data
-    })
+      data,
+    });
   }
-  async updateNotificationStatus(id: string, status: NotificationStatus): Promise<Notification> {
+  async updateNotificationStatus(
+    id: string,
+    status: NotificationStatus,
+  ): Promise<Notification> {
     return prisma.notification.update({
       where: { id },
-      data:{status}
-    })
+      data: { status },
+    });
   }
-  async getDeliveriesByNotificationId(notificationId: string): Promise<Delivery[]> {
+  async getDeliveriesByNotificationId(
+    notificationId: string,
+  ): Promise<Delivery[]> {
     return prisma.delivery.findMany({
       where: { notificationId },
       orderBy: { createdAt: "asc" },
-    })
+    });
   }
 }
-  
+
 
 
 ================================================
@@ -980,8 +1313,6 @@ export type GetUserNotificationsQuery = z.infer<typeof GetUserNotificationsQuery
 ================================================
 FILE: apps/notification-service/src/modules/notification/notification.service.ts
 ================================================
-// notification.service.ts
-
 import {
   NotFoundError,
   ValidationError,
@@ -991,6 +1322,7 @@ import type { NotificationInterface } from "./notification.interface.js";
 import type { CreateNotificationInput } from "./notification.schema.js";
 import { enqueueDelivery } from "../../infrastructure/queue.js";
 import { logger } from "../../config/logger.js";
+import { preferenceService } from "../preference/preference.container.js";
 
 const DEFAULT_CHANNELS: DeliveryChannel[] = ["IN_APP", "EMAIL"];
 
@@ -998,7 +1330,14 @@ export class NotificationService {
   constructor(private readonly repo: NotificationInterface) {}
 
   async create(input: CreateNotificationInput) {
-    // 1. Persist Notification + Deliveries (QUEUED) in one TX
+    // 1. Resolve channels against user preferences
+        //    - missing pref = enabled (opt-out)
+        //    - IN_APP always kept
+        //    - disabled channels are skipped (no Delivery row)
+        const channels = await preferenceService.resolveChannels(
+              input.userId,
+              DEFAULT_CHANNELS,
+            );
     const notification = await this.repo.create({
       userId: input.userId,
       tenantId: input.tenantId ?? null,
@@ -1007,7 +1346,7 @@ export class NotificationService {
       body: input.body,
       data: input.data ?? undefined,
       status: "PENDING",
-      channels: DEFAULT_CHANNELS,
+      channels,
     });
 
     // 2. Enqueue one job per delivery (after TX committed)
@@ -1218,6 +1557,226 @@ export class InAppAdapter implements ChannelAdapter{
 
 
 ================================================
+FILE: apps/notification-service/src/modules/preference/preference.container.ts
+================================================
+import { PreferenceRepository } from "./preference.repository";
+import { PreferenceService } from "./preference.service";
+
+const preferenceRepository = new PreferenceRepository();
+export const preferenceService=new PreferenceService(preferenceRepository)
+
+
+================================================
+FILE: apps/notification-service/src/modules/preference/preference.controller.ts
+================================================
+import { asyncHandler } from "@notification/shared-utils";
+import type { Request, Response } from "express";
+import type { UpdatePreferencesBody } from "./preference.schema.js";
+import { preferenceService } from "./preference.container.js";
+
+export const getPreferences = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.params.userId as string;
+  const result = await preferenceService.getEffective(userId);
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+});
+
+export const updatePreferences = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.params.userId as string;
+  const body = req.body as UpdatePreferencesBody;
+
+  const result = await preferenceService.update(userId, body.preferences);
+
+  res.status(200).json({
+    success: true,
+    message: "Preferences updated",
+    data: result,
+  });
+});
+
+
+================================================
+FILE: apps/notification-service/src/modules/preference/preference.interface.ts
+================================================
+import type { DeliveryChannel } from "@notification/database";
+
+export type PreferenceRow={
+  id: string;
+  userId: string;
+  channel: DeliveryChannel;
+  enabled: boolean;
+  createdAt: Date;
+  updatedAt:Date
+}
+export interface PreferenceInterface{
+  findByUserId(userId: string): Promise<PreferenceRow[]>
+  upsertMany(userId:string,items:Array<{channel:DeliveryChannel,enabled:boolean}>):Promise<PreferenceRow[]>
+  getEnabledMap(userId:string):Promise<Map<DeliveryChannel,boolean>>
+}
+
+
+================================================
+FILE: apps/notification-service/src/modules/preference/preference.repository.ts
+================================================
+import type{ DeliveryChannel } from "@notification/database";
+import { prisma } from "../../infrastructure/prisma.js";
+import { PreferenceInterface, PreferenceRow } from "./preference.interface.js";
+
+export class PreferenceRepository implements PreferenceInterface{
+  async findByUserId(userId: string): Promise<PreferenceRow[]> {
+    return prisma.notificationPreference.findMany({
+      where: { userId },
+      orderBy: { channel: "asc" },
+    })
+  }
+  async upsertMany(userId: string, items: Array<{ channel: DeliveryChannel; enabled: boolean; }>): Promise<PreferenceRow[]> {
+    await prisma.$transaction(items.map((item) => prisma.notificationPreference.upsert({
+      where: {
+        userId_channel:{userId,channel:item.channel}
+      },
+      create: {
+        userId,
+        channel: item.channel,
+                    enabled: item.enabled,
+      },
+      update: {
+        enabled: item.enabled,
+      }
+    })))
+    return this.findByUserId(userId)
+  }
+  /**
+     * Returns a map channel â†’ enabled.
+     * Missing channel means enabled (opt-out default).
+     */
+  async getEnabledMap(userId: string): Promise<Map<DeliveryChannel, boolean>> {
+    const rows = await this.findByUserId(userId);
+    const map = new Map<DeliveryChannel, boolean>();
+    for (const row of rows) {
+      map.set(row.channel,row.enabled)
+    }
+    return map;
+  }
+}
+
+
+================================================
+FILE: apps/notification-service/src/modules/preference/preference.route.ts
+================================================
+import express from "express";
+import { validate } from "../../middlewares/validate.middleware.js";
+import { adminAuthMiddleware } from "../../middlewares/admin-auth.middleware.js";
+import {
+  UpdatePreferencesBodySchema,
+  UserIdParamsSchema,
+} from "./preference.schema.js";
+import { getPreferences, updatePreferences } from "./preference.controller.js";
+
+const router = express.Router({ mergeParams: true });
+
+// Protect with existing admin API key until real user auth exists
+router.use(adminAuthMiddleware);
+
+router
+  .route("/")
+  .get(validate(UserIdParamsSchema, "params"), getPreferences)
+  .put(
+    validate(UserIdParamsSchema, "params"),
+    validate(UpdatePreferencesBodySchema),
+    updatePreferences,
+  );
+
+export default router;
+
+
+================================================
+FILE: apps/notification-service/src/modules/preference/preference.schema.ts
+================================================
+import { z } from "zod"
+
+export const PreferenceItemSchema = z.object({
+  channel: z.enum(["IN_APP", "EMAIL", "SMS", "PUSH"]),
+  enabled:z.boolean()
+})
+
+export const UpdatePreferencesBodySchema = z.object({
+  preferences:z.array(PreferenceItemSchema).min(1)
+})
+
+export type UpdatePreferencesBody = z.infer<typeof UpdatePreferencesBodySchema>;
+
+export const UserIdParamsSchema = z.object({
+  userId: z.string().min(1, "userId is required"),
+});
+
+export type UserIdParams = z.infer<typeof UserIdParamsSchema>;
+
+
+================================================
+FILE: apps/notification-service/src/modules/preference/preference.service.ts
+================================================
+import type { DeliveryChannel } from "@notification/database";
+import { PreferenceRepository } from "./preference.repository.js";
+import { ValidationError } from "@notification/shared-utils";
+
+const ALL_CHANNELS: DeliveryChannel[] = ["EMAIL", "IN_APP", "PUSH", "SMS"]
+
+export class PreferenceService{
+  constructor(private readonly repo: PreferenceRepository) { }
+  /**
+     * Effective preferences: missing row = enabled (opt-out).
+     */
+  async getEffective(userId: string) {
+    if (!userId) throw new ValidationError("userId is required");
+    
+        const rows = await this.repo.findByUserId(userId);
+        const byChannel = new Map(rows.map((r) => [r.channel, r.enabled]));
+    
+        const preferences = ALL_CHANNELS.map((channel) => ({
+          channel,
+          enabled: byChannel.get(channel) ?? true, // opt-out default
+        }));
+    
+    return { userId, preferences };
+  }
+  async update(userId: string, items: Array<{ channel: DeliveryChannel; enabled: boolean }>) {
+    if (!userId) throw new ValidationError("userId is required");
+        if (!items.length) throw new ValidationError("preferences array is required");
+    
+        await this.repo.upsertMany(userId, items);
+        return this.getEffective(userId);
+  }
+  /**
+     * Resolve which channels should actually get a Delivery row.
+     * - Missing preference = enabled
+     * - IN_APP is always kept (product policy)
+     */
+    async resolveChannels(
+      userId: string,
+      requested: DeliveryChannel[],
+    ): Promise<DeliveryChannel[]> {
+      const enabledMap = await this.repo.getEnabledMap(userId);
+  
+      const filtered = requested.filter((ch) => {
+        // IN_APP always on
+        if (ch === "IN_APP") return true;
+        return enabledMap.get(ch) !== false;
+      });
+  
+      // Guarantee IN_APP is present even if caller forgot it
+      if (!filtered.includes("IN_APP")) {
+        filtered.unshift("IN_APP");
+      }
+  
+      return filtered;
+    }
+}
+
+
+================================================
 FILE: apps/notification-worker/package.json
 ================================================
 {
@@ -1238,9 +1797,11 @@ FILE: apps/notification-worker/package.json
     "nodemailer": "^10.x",
     "pg": "^8.x",
     "pino": "^9.x",
-    "zod": "^4.x"
+    "zod": "^4.x",
+    "kafkajs": "^2.2.4"
   }
 }
+
 
 
 ================================================
@@ -1255,19 +1816,6 @@ FILE: apps/notification-worker/tsconfig.json
   },
   "include": ["src"]
 }
-
-
-================================================
-FILE: apps/notification-worker/.env.example
-================================================
-NODE_ENV=development
-LOG_LEVEL=info
-DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
-REDIS_URL=redis://localhost:6379
-EMAIL_ENABLED=true
-SMTP_HOST=localhost
-SMTP_PORT=1025
-SMTP_FROM=noreply@notification.local
 
 
 ================================================
@@ -1448,7 +1996,7 @@ const envSchema = z.object({
   LOG_LEVEL: z.string().default("info"),
   DATABASE_URL: z.string(),
   REDIS_URL: z.string(),
-
+  KAFKA_BROKER: z.string().default("localhost:9096"),
   EMAIL_ENABLED: z
     .enum(["true", "false"])
     .default("true")
@@ -1559,6 +2107,94 @@ export const logger = {
 
 
 ================================================
+FILE: apps/notification-worker/src/infrastructure/outbox-publisher.ts
+================================================
+// infrastructure/outbox-publisher.ts (conceptual)
+import { Kafka } from "kafkajs";
+import { prisma } from "./prisma.js";
+import { config } from "../config/index.js";
+import { logger } from "../config/logger.js";
+
+const TOPIC = "notification.events";
+const BATCH_SIZE = 50;
+const POLL_MS = 1000;
+
+const kafka = new Kafka({
+  clientId: "notification-outbox-publisher",
+  brokers: [config.KAFKA_BROKER],
+});
+
+const producer = kafka.producer({ idempotent: true });
+
+export async function startOutboxPublisher() {
+  await producer.connect();
+
+  const tick = async () => {
+    try {
+      // Fetch unpublished
+      const rows = await prisma.outbox.findMany({
+        where: { publishedAt: null },
+        orderBy: { createdAt: "asc" },
+        take: BATCH_SIZE,
+      });
+
+      if (rows.length === 0) return;
+
+      for (const row of rows) {
+        try {
+          await producer.send({
+            topic: TOPIC,
+            messages: [
+              {
+                key: row.aggregateId,           // ordering per aggregate
+                value: JSON.stringify({
+                  eventId: row.eventId,
+                  eventType: row.eventType,
+                  aggregateType: row.aggregateType,
+                  aggregateId: row.aggregateId,
+                  payload: row.payload,
+                  occurredAt: row.createdAt.toISOString(),
+                }),
+                headers: {
+                  "event-id": row.eventId,
+                  "event-type": row.eventType,
+                },
+              },
+            ],
+          });
+
+          // Mark published only after Kafka ack
+          await prisma.outbox.update({
+            where: { id: row.id },
+            data: {
+              publishedAt: new Date(),
+              attempts: { increment: 1 },
+              lastError: null,
+            },
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          await prisma.outbox.update({
+            where: { id: row.id },
+            data: {
+              attempts: { increment: 1 },
+              lastError: message,
+            },
+          });
+          logger.error("Outbox publish failed", { outboxId: row.id, error: message });
+        }
+      }
+    } catch (err) {
+      logger.error(err, "Outbox publisher tick failed");
+    }
+  };
+
+  setInterval(() => void tick(), POLL_MS);
+  logger.info("Outbox publisher started");
+}
+
+
+================================================
 FILE: apps/notification-worker/src/infrastructure/prisma.ts
 ================================================
 import pg from "pg";
@@ -1596,6 +2232,7 @@ FILE: apps/notification-worker/src/infrastructure/queue.ts
 import IORedis from "ioredis";
 import { config } from "../config";
 import { ConnectionOptions, Queue } from "bullmq";
+import { logger } from "../config/logger";
 
 export const DELIVERY_QUEUE_NAME = "notification-deliveries"
 export const DELIVERY_JOB_NAME = "process-delivery"
@@ -1614,17 +2251,47 @@ export function createDeliveryQueue(connection: ConnectionOptions) {
   return new Queue<ProcessDeliveryJob>(DELIVERY_QUEUE_NAME,{connection})
 }
 
+/**
+ * Enqueue (or re-enqueue) a delivery job.
+ * delayMs > 0 = backoff. jobId includes attempt so retries stay unique.
+ */
+export async function enqueueDelivery(deliveryId: string, delayMs = 0, attempt = 1):Promise<void> {
+  const connection = createRedisConnection();
+  const queue = createDeliveryQueue(connection);
+  try {
+    await queue.add(DELIVERY_JOB_NAME, {
+      deliveryId
+    }, {
+      jobId: `deliveryId-${deliveryId}-attempt-${attempt}`,
+      delay: delayMs > 0 ? delayMs : undefined,
+      removeOnComplete: 1000,
+      removeOnFail:5000
+    })
+    logger.debug("Enqueued delivery job", { deliveryId, delayMs, attempt });
+  } finally {
+    await queue.close();
+        await connection.quit();
+  }
+}
+
 
 
 ================================================
 FILE: apps/notification-worker/src/processors/delivery.processor.ts
 ================================================
 import type { Job } from "bullmq";
-import type { DeliveryChannel, NotificationStatus } from "@notification/database";
+import type {
+  DeliveryChannel,
+  NotificationStatus,
+} from "@notification/database";
 import { prisma } from "../infrastructure/prisma.js";
-import type { ProcessDeliveryJob } from "../infrastructure/queue.js";
+import {
+  enqueueDelivery,
+  type ProcessDeliveryJob,
+} from "../infrastructure/queue.js";
 import type { ChannelAdapter } from "../adapters/channel-adapter.interface.js";
 import { logger } from "../config/logger.js";
+import { calculateBackoffMs } from "@notification/shared-utils";
 
 export function createDeliveryProcessor(
   adapters: Map<DeliveryChannel, ChannelAdapter>,
@@ -1670,9 +2337,20 @@ export function createDeliveryProcessor(
       return;
     }
 
+    const updated = await prisma.delivery.findUnique({
+      where: { id: deliveryId },
+    });
+    const currentAttempts = updated?.attempts ?? delivery.attempts + 1;
+    const maxAttempts = delivery.maxAttempts;
+
     const adapter = adapters.get(delivery.channel);
     if (!adapter) {
-      await markFailed(deliveryId, `No adapter for channel ${delivery.channel}`);
+      await handleFailure(
+        deliveryId,
+        `No adapter for channel ${delivery.channel}`,
+        currentAttempts,
+        maxAttempts,
+      );
       await rollUpNotificationStatus(delivery.notificationId);
       return;
     }
@@ -1686,14 +2364,32 @@ export function createDeliveryProcessor(
         data: delivery.notification.data ?? undefined,
       });
 
-      await prisma.delivery.update({
-        where: { id: deliveryId },
-        data: {
-          status: "SENT",
-          sentAt: new Date(),
-          providerMessageId: result.providerMessageId ?? null,
-          lastError: null,
-        },
+      await prisma.$transaction(async (tx) => {
+        await tx.delivery.update({
+          where: { id: deliveryId },
+          data: {
+            status: "SENT",
+            sentAt: new Date(),
+            providerMessageId: result.providerMessageId ?? null,
+            lastError: null,
+          },
+        });
+      
+        await tx.outbox.create({
+          data: {
+            eventId: crypto.randomUUID(),
+            eventType: "delivery.sent",
+            aggregateType: "Delivery",
+            aggregateId: deliveryId,
+            payload: {
+              deliveryId,
+              notificationId: delivery.notificationId,
+              channel: delivery.channel,
+              providerMessageId: result.providerMessageId,
+              sentAt: new Date().toISOString(),
+            },
+          },
+        });
       });
 
       logger.info("Delivery sent", {
@@ -1708,21 +2404,81 @@ export function createDeliveryProcessor(
         channel: delivery.channel,
         error: message,
       });
-      await markFailed(deliveryId, message);
+      await handleFailure(deliveryId, message, currentAttempts, maxAttempts);
     }
 
     await rollUpNotificationStatus(delivery.notificationId);
   };
 }
+/**
+ * attempts < maxAttempts â†’ FAILED then back to QUEUED + delayed re-enqueue
+ * else â†’ DEAD
+ */
+async function handleFailure(
+  deliveryId: string,
+  lastError: string,
+  attempts: number,
+  maxAttempts: number,
+) {
+  if (attempts < maxAttempts) {
+    const delayMs = calculateBackoffMs(attempts);
+    // Mark FAILED (visible), then QUEUED so the delayed job can CAS
+    
+    await prisma.$transaction(async (tx) => {
+     await tx.delivery.update({
+        where: { id: deliveryId },
+        data:{status:"FAILED"}
+      })
+      await tx.outbox.create({
+        data: {
+          eventId: crypto.randomUUID(),
+          eventType: "delivery.failed",
+          aggregateType: "Delivery",
+          aggregateId: deliveryId,
+          payload: {
+            deliveryId, 
+          }
+        }
+      })
+    })
+    await prisma.delivery.update({
+      where: { id: deliveryId },
+      data: { status: "QUEUED" },
+    });
+    await enqueueDelivery(deliveryId, delayMs, attempts + 1);
+    logger.info("Delivery scheduled for retry", {
+      deliveryId,
+      attempts,
+      maxAttempts,
+      delayMs,
+    });
+  } else {
+    await prisma.$transaction(async (tx) => {
+      await tx.delivery.update({
+        where: { id: deliveryId },
+        data: { status: "DEAD",lastError }
+      })
+      await tx.outbox.create({
+        data: {
+          eventId: crypto.randomUUID(),
+          eventType: "delivery.dead",
+          aggregateType: "Delivery",
+          aggregateId: deliveryId,
+          payload: {
+            deliveryId,
+            lastError
+          }
+        }
+      })
+    })
 
-async function markFailed(deliveryId: string, lastError: string) {
-  await prisma.delivery.update({
-    where: { id: deliveryId },
-    data: {
-      status: "FAILED",
+    logger.warn("Delivery moved to DEAD", {
+      deliveryId,
+      attempts,
+      maxAttempts,
       lastError,
-    },
-  });
+    });
+  }
 }
 
 async function rollUpNotificationStatus(notificationId: string) {
@@ -1764,6 +2520,7 @@ async function rollUpNotificationStatus(notificationId: string) {
     status,
   });
 }
+
 
 
 ================================================
@@ -1838,13 +2595,6 @@ FILE: packages/database/tsconfig.json
 
 
 ================================================
-FILE: packages/database/.env.example
-================================================
-DATABASE_URL=postgresql://notification:notification@localhost:5432/notification?schema=public
-
-
-
-================================================
 FILE: packages/database/prisma/schema.prisma
 ================================================
 generator client {
@@ -1889,7 +2639,7 @@ type                      String
 title                      String
 data                        Json?
 updatedAt                   DateTime           @updatedAt
-  
+
 @@index([userId,createdAt])
 @@index([tenantId,userId])
 deliveries      Delivery[]
@@ -1914,6 +2664,36 @@ notification           Notification @relation(fields:[notificationId],references
 @@index([status, createdAt])
 @@index([notificationId])
 }
+
+model NotificationPreference{
+id                    String        @id @default(uuid())
+userId                String
+channel                DeliveryChannel
+enabled                Boolean         @default(true)
+createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  @@unique([userId,channel])
+  @@index([userId])
+}
+
+model Outbox{
+id                    String        @id @default(uuid())
+eventId                String         @unique
+eventType               String
+aggregateType        String                     // "Notification" | "Delivery"
+aggregateId          String                     // notificationId or deliveryId
+createdAt     DateTime  @default(now())
+payload            Json
+publishedAt         DateTime?
+attempts            Int              @default(0)
+lastError             String?
+
+
+  @@index([publishedAt, createdAt])        // publisher poll
+    @@index([aggregateType, aggregateId])
+}
+
 
 
 ================================================

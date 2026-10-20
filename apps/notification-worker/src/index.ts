@@ -11,6 +11,7 @@ import { InAppAdapter } from "./adapters/in-app.adapter.js";
 import { EmailAdapter } from "./adapters/email.adapter.js";
 import type { DeliveryChannel } from "@notification/database";
 import type { ChannelAdapter } from "./adapters/channel-adapter.interface.js";
+import { startOutboxPublisher } from "./infrastructure/outbox-publisher.js";
 
 async function main() {
   const connection = createRedisConnection();
@@ -42,7 +43,7 @@ async function main() {
       error: err.message,
     });
   });
-
+await startOutboxPublisher();
   logger.info(`notification-worker started (queue=${DELIVERY_QUEUE_NAME})`);
 
   const shutdown = async (signal: string) => {
